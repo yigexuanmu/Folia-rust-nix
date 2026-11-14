@@ -14,8 +14,13 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 // Debug builds keep their data apart from release ones, and both stay apart from the Electron app's "Folia" folder.
 const APP_DIR: &str = if cfg!(debug_assertions) { "Folia-rust-dev" } else { "Folia-rust" };
-const DEFAULT_LOG: &str =
-    if cfg!(debug_assertions) { "debug,wgpu=warn,naga=warn,iced=info,cosmic_text=warn" } else { "info" };
+// wgpu-hal's Vulkan backend warns on every `VK_SUBOPTIMAL_KHR` present; on NVIDIA Wayland that is every frame,
+// which floods the runtime log with nothing the user can act on. Errors still come through.
+const DEFAULT_LOG: &str = if cfg!(debug_assertions) {
+    "debug,wgpu=warn,naga=warn,iced=info,cosmic_text=warn,wgpu_hal::vulkan=error"
+} else {
+    "info,wgpu_hal::vulkan=error"
+};
 
 fn window_settings() -> anyhow::Result<iced::window::Settings> {
     let image =
