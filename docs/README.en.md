@@ -33,15 +33,23 @@ The Android client is [Folia-rust-android](https://github.com/Techuouo520/Folia-
 ## Features
 
 - **LX Music custom sources**: paste download links or import script files, independently enable multiple sources and set their priority for NetEase, KuGou and QQ Music. Sources run in isolation and fall back in order, with quality downgrade and native API fallback if all fail.
-- **Alternate audio sources**: when a track is member-only or otherwise restricted and the platform offers only a preview, other available sources are tried automatically. The switch is under Settings → Song unlock and is on by default.
 - **Cover wall home**: an endless wall of covers with inertial dragging, and a spine-style side seam that opens and closes.
 - **Lyric visualization**: lyric styles ported one by one from the original, moving with the music in real time.
 - **Lyric style workbench**: live preview and per-style tuning.
 - **Online platforms**: NetEase Cloud Music, KuGou, QQ Music, Bodian, Qishui and Spotify, with QR sign-in, multiple accounts, playlists, radio, explore pages, word-by-word lyrics and audio quality selection.
-- **Sign-in persistence**: after signing in, quitting and reopening keeps you signed in without scanning again.
 - **Local music**: scanning, metadata, a library and folder watching.
 - **Languages**: Simplified Chinese, Traditional Chinese, English, Bahasa Indonesia and Tiếng Việt.
-- **Credential safety**: cookies, tokens and sign-in state are stored only in the system keyring; without a usable keyring they are kept encrypted on this machine.
+- **Credential safety**: cookies, tokens and sign-in state are stored in the system keyring.
+
+## Changes in this fork
+
+Built on top of upstream [Folia-rust](https://github.com/Techuouo520/Folia-rust), this fork adds:
+
+- **Song unlock**: when a track is member-only or otherwise restricted and the platform offers only a preview, other available sources are tried automatically. The switch is under Settings → Song unlock and is on by default.
+- **Sign-in persistence**: sign in once and stay signed in after quitting and reopening, without scanning again. Credentials and sign-in state go to the system keyring — Secret Service (GNOME Keyring / KWallet) on Linux, the Keychain on macOS, Credential Manager on Windows. With no usable keyring, Linux keeps them encrypted on this machine instead; when neither is available, the sign-in panel says so instead of pretending to save.
+- **Nix packaging**: a flake, with a desktop entry and icon once installed.
+
+None of this is tied to a distribution or desktop environment: Linux, macOS and Windows build from the same code, and the Nix packaging is an optional extra for Nix setups.
 
 ## Lyric styles
 
