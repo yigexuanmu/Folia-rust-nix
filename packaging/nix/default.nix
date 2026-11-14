@@ -75,6 +75,12 @@ rustPlatform.buildRustPackage {
       install -Dm644 "$file" "$out/share/doc/folia/$(basename "$file")"
     done
 
+    # 桌面菜单项：.desktop 与图标一起装，装完就能在应用列表里点到。
+    # 图标名与 desktop 里的 Icon= 一致（folia），StartupWMClass 也取 folia——
+    # winit 在 X11 上把 argv[0] 的文件名写进 WM_CLASS，wrapper 与真实二进制同名。
+    install -Dm644 packaging/folia.desktop $out/share/applications/folia.desktop
+    install -Dm644 assets/icon.png $out/share/icons/hicolor/512x512/apps/folia.png
+
     makeWrapper $out/libexec/folia/folia $out/bin/folia \
       --prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath libraries}
 
