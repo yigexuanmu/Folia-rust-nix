@@ -227,7 +227,7 @@ impl Omni {
             std::fs::rename(partial, &path).map_err(io_err)?;
             return Ok(path.into());
         }
-        self.load_source(&key, || provider.audio_source(song, level), load).await
+        self.load_source(&key, || self.platform_audio_source(provider, song, track, level), load).await
     }
 
     async fn load_source<F: Future<Output = Result<AudioSource, OmniError>>>(

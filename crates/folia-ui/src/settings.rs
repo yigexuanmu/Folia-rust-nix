@@ -39,6 +39,7 @@ pub enum Section {
     Graphics,
     Developer,
     Sources,
+    Unlock,
 }
 
 impl Section {
@@ -50,6 +51,7 @@ impl Section {
             Section::Graphics => "options.settingsPageGraphics",
             Section::Developer => "options.settingsPageDeveloper",
             Section::Sources => "options.customSources",
+            Section::Unlock => "options.songUnlock",
         }
     }
 
@@ -61,6 +63,7 @@ impl Section {
             Section::Graphics => Icon::Gauge,
             Section::Developer => Icon::Terminal,
             Section::Sources => Icon::ListMusic,
+            Section::Unlock => Icon::LockOpen,
         }
     }
 }
@@ -68,7 +71,7 @@ impl Section {
 /// The side list's groups, `SETTINGS_NAV_GROUP_SPECS` without the categories Folia-rust has nothing on yet.
 const NAV: [(&str, &[Section]); 3] = [
     ("options.settingsGroupInterface", &[Section::Appearance, Section::Player]),
-    ("options.settingsGroupApp", &[Section::General, Section::Graphics, Section::Sources]),
+    ("options.settingsGroupApp", &[Section::General, Section::Graphics, Section::Sources, Section::Unlock]),
     ("options.settingsGroupAdvanced", &[Section::Developer]),
 ];
 
@@ -88,11 +91,16 @@ const PERFORMANCE: GroupDef =
     GroupDef { id: "graphicsPerformance", title: "options.labPerformanceSection", bare: false };
 const DEVELOPER: GroupDef = GroupDef { id: "developerTools", title: "options.developerTools", bare: true };
 const SOURCES: GroupDef = GroupDef { id: "customSources", title: "options.customSources", bare: true };
+const UNLOCK: GroupDef = GroupDef { id: "songUnlock", title: "options.songUnlock", bare: true };
 
 /// Every option the pages draw, in page order: what the search finds.
-const OPTIONS: [(Section, GroupDef, &str); 13] = [
+const OPTIONS: [(Section, GroupDef, &str); 17] = [
     (Section::Sources, SOURCES, "options.sourceImportUrl"),
     (Section::Sources, SOURCES, "options.sourceImport"),
+    (Section::Unlock, UNLOCK, "options.songUnlockEnable"),
+    (Section::Unlock, UNLOCK, "options.songUnlockServerNetease"),
+    (Section::Unlock, UNLOCK, "options.songUnlockServerBodian"),
+    (Section::Unlock, UNLOCK, "options.songUnlockServerKuwo"),
     (Section::Appearance, LYRICS, "options.lyricsAnimationAdjust"),
     (Section::Appearance, THEME, "options.daylightMode"),
     (Section::Player, BAR, "options.playerBottomBarOffset"),
@@ -140,6 +148,8 @@ struct Motion {
 /// What the pages show and change; the shell owns the values.
 pub struct Values<'a> {
     pub sources: &'a crate::sources::Sources,
+    /// 音源兜底的开关与音源表。
+    pub unlock: &'a folia_store::UnlockSettings,
     pub language: LanguagePreference,
     pub resolved: Language,
     pub appearance: &'a AppearanceSettings,
@@ -698,6 +708,32 @@ impl Settings {
                 vec![group(PERFORMANCE, rows)]
             }
             Section::Sources => values.sources.groups(i18n, tokens),
+            Section::Unlock => {
+                let on = values.unlock.enabled;
+                let mut rows = vec![row(
+                    "options.songUnlockEnable",
+                    Some(i18n.t("options.songUnlockDesc").to_owned()),
+                    false,
+                    kit::toggle(tokens, if on { 1.0 } else { 0.0 }, crate::Message::UnlockEnabled(!on)),
+                )];
+                // 总开关关着时，逐源的开关不显示：关着还摆一排开关只会让人以为它们在起作用。
+                if on {
+                    for source in folia_store::UnlockSource::ALL {
+                        let enabled = values.unlock.server_enabled(source);
+                        rows.push(row(
+                            source.label_key(),
+                            Some(i18n.t(source.hint_key()).to_owned()),
+                            true,
+                            kit::toggle(
+                                tokens,
+                                if enabled { 1.0 } else { 0.0 },
+                                crate::Message::UnlockToggle(source, !enabled),
+                            ),
+                        ));
+                    }
+                }
+                vec![group(UNLOCK, rows)]
+            }
             Section::Developer => crate::developer::settings_groups(
                 i18n,
                 tokens,

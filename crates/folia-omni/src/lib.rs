@@ -9,6 +9,7 @@ mod providers;
 mod qr;
 mod reads;
 mod session;
+pub mod unlock;
 
 use std::future::Future;
 use std::hash::{Hash, Hasher};
@@ -372,6 +373,9 @@ pub struct Omni {
     cover_locks: Arc<CoverLocks>,
     sources: Arc<lx::Sources>,
     audio_cache: Arc<audio_cache::AudioCache>,
+    /// 音源兜底：VIP/版权受限时去问的第三方音源，与它的开关。
+    unlock: Arc<unlock::Unlock>,
+    unlock_settings: Arc<parking_lot::RwLock<folia_store::UnlockSettings>>,
 }
 
 impl Omni {
@@ -383,6 +387,8 @@ impl Omni {
         let covers = Arc::new(tokio::sync::Semaphore::new(COVER_DOWNLOADS));
         Ok(Self {
             providers: Arc::new(providers::all(&http)),
+            unlock: Arc::new(unlock::Unlock::new(http.clone())),
+            unlock_settings: Arc::default(),
             http,
             cache_dir,
             keyring_service,
@@ -477,6 +483,61 @@ impl Omni {
 
     pub fn source_update_alerts(&self) -> Vec<(String, lx::UpdateAlert)> {
         self.sources.take_alerts()
+    }
+
+    /// 读入音源兜底的设置；启动时一次就够。
+    pub fn restore_unlock(&self, settings: folia_store::UnlockSettings) {
+        *self.unlock_settings.write() = settings;
+    }
+
+    pub fn unlock_settings(&self) -> folia_store::UnlockSettings {
+        self.unlock_settings.read().clone()
+    }
+
+    /// 改音源兜底的设置：下一次取地址起生效；已记下的试听地址不再复用，免得改完还放试听。
+    pub fn set_unlock_settings(&self, settings: folia_store::UnlockSettings) {
+        let changed = *self.unlock_settings.read() != settings;
+        *self.unlock_settings.write() = settings;
+        if changed {
+            self.audio_cache.invalidate();
+        }
+    }
+
+    /// 把三个第三方音源指向别的地址，测试用。
+    pub fn with_unlock_endpoints(mut self, endpoints: unlock::Endpoints) -> Self {
+        self.unlock = Arc::new(unlock::Unlock::with_endpoints(self.http.clone(), endpoints));
+        self
+    }
+
+    /// 平台自己的地址。平台说放不了（会员、版权、下架）、或只肯给一段试听时，按设置里的顺序去问第三方
+    /// 音源：问到就给整首的地址，问不到就照平台的原样交回去（试听照放、失败照报）。
+    ///
+    /// 连不上、超时、被平台拒绝这几种不问：换一个音源也一样拿不到，只会多等几秒。
+    pub(crate) async fn platform_audio_source(
+        &self,
+        provider: &dyn Provider,
+        song: &OnlineId,
+        track: &Track,
+        level: AudioQuality,
+    ) -> Result<AudioSource, OmniError> {
+        let native = provider.audio_source(song, level).await;
+        let worth_asking = match &native {
+            Ok(source) => source.preview,
+            Err(OmniError::Unavailable | OmniError::SubscriptionRequired) => true,
+            Err(_) => false,
+        };
+        if !worth_asking {
+            return native;
+        }
+        let settings = self.unlock_settings.read().clone();
+        let Some(unlocked) = self.unlock.source(track, &settings).await else { return native };
+        Ok(AudioSource {
+            extension: unlock::audio_extension(&unlocked.url),
+            url: unlocked.url,
+            // 第三方音源交出来的是整首，不是试听片段。
+            preview: false,
+            level,
+        })
     }
 
     /// Tries enabled scripts in list order, lowering quality within each before moving to the next source.

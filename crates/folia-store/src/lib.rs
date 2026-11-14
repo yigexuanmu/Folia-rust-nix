@@ -12,6 +12,7 @@ mod player;
 mod runtime_log;
 mod sources;
 mod theme;
+mod unlock;
 mod visualizer;
 
 pub use appearance::{
@@ -29,6 +30,7 @@ pub use player::{BOTTOM_BAR_BASE, PlayerSettings, bottom_bar_max_offset, clamp_b
 pub use runtime_log::{LogLine, RuntimeLog, clock, error_chain, iso};
 pub use sources::{CustomSource, SourceMetadata, SourcePlatform, SourceSettings};
 pub use theme::{DualTheme, StoredTheme, ThemeSettings, ThemeSource};
+pub use unlock::{UnlockServer, UnlockSettings, UnlockSource};
 pub use visualizer::VisualizerSettings;
 
 use std::fs;

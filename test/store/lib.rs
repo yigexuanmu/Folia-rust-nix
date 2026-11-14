@@ -7,7 +7,7 @@ use std::fs;
 use folia_core::{AudioQuality, Language, LanguagePreference};
 use folia_store::{
     AppearanceSettings, FontStyle, GeneralSettings, HomeTab, PlaybackSettings, RowSource, Store, StoreError,
-    SubtitleContentMode, SubtitleLayout, VisualizerSettings,
+    SubtitleContentMode, SubtitleLayout, UnlockSettings, UnlockSource, VisualizerSettings,
 };
 
 mod developer;
@@ -167,4 +167,32 @@ fn visualizer_tables_keep_style_keys() {
     assert!(text.contains("wordSpacing = 1.25"));
     let loaded = store.load::<VisualizerSettings>().unwrap();
     assert_eq!(loaded, settings);
+}
+
+/// 音源兜底的自有文件：改动原样回来，缺项与多余项都按默认表补齐。
+#[test]
+fn song_unlock_settings_round_trip_and_fill_the_default_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at(dir.path());
+    let mut settings = UnlockSettings::default();
+    settings.set_server(UnlockSource::Kuwo, true);
+    settings.set_server(UnlockSource::Bodian, false);
+    store.save(&settings).unwrap();
+    let text = fs::read_to_string(dir.path().join("unlock.toml")).unwrap();
+    assert!(text.contains("schema_version = 1"), "{text}");
+    assert_eq!(store.load::<UnlockSettings>().unwrap(), settings);
+
+    // 手改过的旧文件：只有一路音源、还有个不认识的键。
+    fs::write(
+        dir.path().join("unlock.toml"),
+        "schema_version = 1\nenabled = false\n\n[[servers]]\nkey = \"kuwo\"\nenabled = true\n\n[[servers]]\nkey = \"qq\"\nenabled = true\n",
+    )
+    .unwrap();
+    let partial: UnlockSettings = store.load().unwrap();
+    assert!(!partial.enabled);
+    assert!(partial.order().is_empty(), "总开关关着时一个音源都不问");
+    assert!(partial.server_enabled(UnlockSource::Kuwo));
+    assert!(partial.server_enabled(UnlockSource::Bodian), "缺的那一路取默认");
+    assert!(!partial.server_enabled(UnlockSource::Netease));
+    assert_eq!(partial.servers().len(), UnlockSource::ALL.len(), "不认识的键被丢掉");
 }

@@ -144,6 +144,7 @@ pub struct Init {
     pub theme: folia_store::ThemeSettings,
     pub audio: folia_store::AudioSettings,
     pub playback: PlaybackSettings,
+    pub unlock: folia_store::UnlockSettings,
     pub player: folia_store::PlayerSettings,
     pub visualizer: VisualizerSettings,
     pub developer: folia_store::DeveloperSettings,
@@ -182,6 +183,10 @@ pub enum Message {
     OpenSettings,
     Settings(settings::Message),
     Sources(sources::Message),
+    /// 音源兜底的总开关。
+    UnlockEnabled(bool),
+    /// 音源兜底里某一路音源的开关。
+    UnlockToggle(folia_store::UnlockSource, bool),
     /// The developer page, its log panel and the two overlays.
     Developer(developer::Message),
     Workbench(workbench::Message),
@@ -352,6 +357,8 @@ pub struct Shell {
     background_upload_generation: u64,
     titlebar: chrome::Titlebar,
     player: folia_store::PlayerSettings,
+    /// 音源兜底的开关与音源表，改动时同步给 Omni。
+    unlock: folia_store::UnlockSettings,
     positioning: Option<positioner::Positioning>,
     login: login::Login,
     /// The lyrics timeline window opened from the capsule.
@@ -380,6 +387,9 @@ impl Shell {
         let omni = Omni::new(init.cache_dir, init.keyring_service)
             .inspect_err(|err| tracing::error!(error = err as &dyn std::error::Error, "online music unavailable"))
             .ok();
+        if let Some(omni) = &omni {
+            omni.restore_unlock(init.unlock.clone());
+        }
         let db_path = init.library_db.clone();
         let (library, load) = LibraryPage::new(
             init.library_db,
@@ -468,6 +478,7 @@ impl Shell {
             background_upload_generation: 0,
             titlebar: chrome::Titlebar::new(std::time::Instant::now()),
             player: init.player,
+            unlock: init.unlock,
             positioning: None,
             login: login::Login::new(std::time::Instant::now()),
             timeline: timeline::Timeline::default(),
@@ -829,6 +840,14 @@ impl Shell {
             }
             Message::Workbench(message) => self.workbench(message),
             Message::Sources(message) => self.sources.update(message, self.omni.clone()),
+            Message::UnlockEnabled(enabled) => {
+                self.unlock.set_enabled(enabled);
+                self.unlock_changed()
+            }
+            Message::UnlockToggle(source, enabled) => {
+                self.unlock.set_server(source, enabled);
+                self.unlock_changed()
+            }
             Message::Settings(message) => {
                 if self.sources.has_alert() && matches!(message, settings::Message::Escape) {
                     return self.sources.update(sources::Message::DismissUpdates, self.omni.clone());
@@ -1923,6 +1942,7 @@ impl Shell {
         if let Some(window) = &self.settings {
             let values = settings::Values {
                 sources: &self.sources,
+                unlock: &self.unlock,
                 language: self.general.language,
                 resolved: self.i18n.language(),
                 appearance: &self.appearance,
@@ -3615,6 +3635,19 @@ impl Shell {
         typeface::language(language);
         tracing::info!(language = language.code(), ?preference, "language switched");
         save(&self.store, &self.general)
+    }
+
+    /// 音源兜底的开关改了：Omni 立刻按新的表取地址，文件随后写。
+    fn unlock_changed(&mut self) -> Task<Message> {
+        if let Some(omni) = &self.omni {
+            omni.set_unlock_settings(self.unlock.clone());
+        }
+        tracing::info!(
+            enabled = self.unlock.enabled,
+            sources = ?self.unlock.order(),
+            "song unlock settings changed"
+        );
+        save(&self.store, &self.unlock)
     }
 }
 
