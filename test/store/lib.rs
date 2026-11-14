@@ -191,8 +191,8 @@ fn song_unlock_settings_round_trip_and_fill_the_default_table() {
     let partial: UnlockSettings = store.load().unwrap();
     assert!(!partial.enabled);
     assert!(partial.order().is_empty(), "总开关关着时一个音源都不问");
-    assert!(partial.server_enabled(UnlockSource::Kuwo));
+    assert!(partial.server_enabled(UnlockSource::Kuwo), "文件里开着的那一路保留");
+    assert!(partial.server_enabled(UnlockSource::Netease), "缺的那一路取默认");
     assert!(partial.server_enabled(UnlockSource::Bodian), "缺的那一路取默认");
-    assert!(!partial.server_enabled(UnlockSource::Netease));
     assert_eq!(partial.servers().len(), UnlockSource::ALL.len(), "不认识的键被丢掉");
 }

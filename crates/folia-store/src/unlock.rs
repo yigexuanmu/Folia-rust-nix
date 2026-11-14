@@ -3,7 +3,7 @@
 // From the fork's `useSongUnlockSettingsStore` (storage keys `use_song_unlock` and `song_unlock_servers`): the
 // whole feature has one switch, and every alternate source has its own, in the order the fork lists them.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::Domain;
 
@@ -27,6 +27,11 @@ impl UnlockSource {
             UnlockSource::Bodian => "bodian",
             UnlockSource::Kuwo => "kuwo",
         }
+    }
+
+    /// Reads a stored spelling; `None` for a key this build does not know.
+    fn from_id(id: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|source| source.id() == id)
     }
 
     pub fn label_key(self) -> &'static str {
@@ -67,7 +72,30 @@ pub struct UnlockSettings {
     /// The fork's `useSongUnlock`: off, and no alternate source is asked at all.
     pub enabled: bool,
     /// What the file holds; read the table through [`UnlockSettings::servers`], which fills in new sources.
+    #[serde(deserialize_with = "stored_servers")]
     pub servers: Vec<UnlockServer>,
+}
+
+/// Reads the stored table, dropping rows whose source this build does not know, so a file written by
+/// a newer fork (or hand-edited) still loads every source it does know.
+fn stored_servers<'de, D>(deserializer: D) -> Result<Vec<UnlockServer>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    struct StoredServer {
+        key: String,
+        #[serde(default)]
+        enabled: bool,
+    }
+
+    let stored = Vec::<StoredServer>::deserialize(deserializer)?;
+    Ok(stored
+        .into_iter()
+        .filter_map(|server| {
+            UnlockSource::from_id(&server.key).map(|key| UnlockServer { key, enabled: server.enabled })
+        })
+        .collect())
 }
 
 impl Default for UnlockSettings {
