@@ -83,6 +83,32 @@ cargo build --release -p folia-app
 
 产物为 `target/release/folia`（Windows 上为 `folia.exe`），运行时需要同目录下的 `assets/`。
 
+### Nix
+
+仓库内包含完整的 Nix flake（`flake.nix`），无需额外配置：
+
+```bash
+# 直接运行（不安装）
+nix run github:yigexuanmu/Folia-rust-nix
+
+# 临时进入 shell
+nix shell github:yigexuanmu/Folia-rust-nix -c folia
+
+# 安装到系统（NixOS flake）
+{
+  inputs = {
+    folia-rust = {
+      url = "github:yigexuanmu/Folia-rust-nix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+  };
+}
+# environment.systemPackages = [ inputs.folia-rust.packages.${system}.default ];
+
+# Home Manager
+# home.packages = [ inputs.folia-rust.packages.${system}.default ];
+```
+
 ## 路线图
 
 - [x] 骨架：窗口、设置、语言切换
