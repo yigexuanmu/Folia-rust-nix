@@ -6,6 +6,8 @@ use folia_core::AudioQuality;
 use folia_omni::{LoginQr, Omni, OmniError, cover_cache_key};
 
 mod like_capabilities;
+#[cfg(unix)]
+mod session;
 mod unlock;
 
 #[test]

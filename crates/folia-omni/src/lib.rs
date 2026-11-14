@@ -8,7 +8,7 @@ mod paging;
 mod providers;
 mod qr;
 mod reads;
-mod session;
+pub mod session;
 pub mod unlock;
 
 use std::future::Future;
@@ -26,6 +26,7 @@ pub use paging::{
     ytm_walk_done,
 };
 pub use qr::LoginQr;
+pub use session::Backend as SessionBackend;
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -56,6 +57,9 @@ pub enum OmniError {
     QrImage(String),
     #[error("system keyring refused")]
     Keyring(#[from] keyring::Error),
+    /// Neither the keyring nor a sealed file could keep the session.
+    #[error("session storage: {0}")]
+    Session(String),
     #[error("cannot write {path}")]
     Io {
         path: PathBuf,
@@ -368,7 +372,8 @@ pub struct Omni {
     providers: Arc<Vec<Box<dyn Provider>>>,
     http: reqwest::Client,
     cache_dir: PathBuf,
-    keyring_service: String,
+    /// 平台会话：密钥库优先，其次是 systemd-creds 封的本机密文文件。
+    sessions: Arc<session::Store>,
     covers: Arc<tokio::sync::Semaphore>,
     cover_locks: Arc<CoverLocks>,
     sources: Arc<lx::Sources>,
@@ -391,7 +396,7 @@ impl Omni {
             unlock_settings: Arc::default(),
             http,
             cache_dir,
-            keyring_service,
+            sessions: Arc::new(session::Store::new(keyring_service)),
             covers,
             cover_locks: Arc::default(),
             sources: Arc::default(),
@@ -700,7 +705,7 @@ impl Omni {
     /// Reads the kept session from the system keyring into the provider. Blocking: call it off the UI thread.
     pub fn restore_session(&self, provider: &str) -> Result<bool, OmniError> {
         let target = self.provider(provider)?;
-        match session::load(&self.keyring_service, provider)? {
+        match self.sessions.load(provider)? {
             Some(saved) => {
                 target.restore_session(&saved)?;
                 Ok(true)
@@ -712,14 +717,25 @@ impl Omni {
     /// Keeps the provider's session in the system keyring, or removes it when signed out. Blocking.
     pub fn save_session(&self, provider: &str) -> Result<(), OmniError> {
         match self.provider(provider)?.session() {
-            Some(value) => session::save(&self.keyring_service, provider, &value),
-            None => session::delete(&self.keyring_service, provider),
+            Some(value) => self.sessions.save(provider, &value),
+            None => self.sessions.delete(provider),
         }
     }
 
-    /// Removes the kept session from the system keyring. Blocking.
+    /// Removes the kept session wherever it lives. Blocking.
     pub fn forget_session(&self, provider: &str) -> Result<(), OmniError> {
-        session::delete(&self.keyring_service, provider)
+        self.sessions.delete(provider)
+    }
+
+    /// Where sessions can be kept, for the interface to report. Blocking on the first call.
+    pub fn session_backend(&self) -> session::Backend {
+        self.sessions.backend()
+    }
+
+    /// Lets sessions fall back to files sealed under `dir` when the keyring does not answer.
+    /// Call it right after construction, before anything reads a session.
+    pub fn keep_sessions_in(&self, dir: PathBuf) {
+        self.sessions.seal_in(dir);
     }
 
     pub async fn user_playlists(&self, provider: &str, user: &str) -> Result<Vec<Collection>, OmniError> {

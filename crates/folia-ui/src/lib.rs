@@ -389,6 +389,9 @@ impl Shell {
             .ok();
         if let Some(omni) = &omni {
             omni.restore_unlock(init.unlock.clone());
+            // 密钥库不可用时把会话封成密文放数据目录，重启还能接着用；没有 systemd-creds 就什么都存不了。
+            omni.keep_sessions_in(init.data_dir.join("session"));
+            tracing::info!(backend = omni.session_backend().label(), "session storage ready");
         }
         let db_path = init.library_db.clone();
         let (library, load) = LibraryPage::new(

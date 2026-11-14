@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use folia_omni::{Account, Collection, ExploreSection, Omni, RadioFeed};
+use folia_omni::{Account, Collection, ExploreSection, Omni, RadioFeed, SessionBackend};
 use iced::Task;
 
 use crate::platform_rows::{ProviderRowStatus, order_provider_rows};
@@ -94,8 +94,10 @@ pub struct Online {
     omni: Option<Omni>,
     /// The platform the online tabs show (`activeProviderId`).
     provider: &'static str,
-    /// Platforms holding a session read from the keyring or signed in during this run.
+    /// Platforms holding a session read from storage or signed in during this run.
     kept: HashSet<&'static str>,
+    /// Where sessions can be kept, so the login panel can say when they cannot be.
+    storage: SessionBackend,
     pub account: AccountState,
     accounts: HashMap<&'static str, AccountState>,
     avatars: HashMap<&'static str, iced::widget::image::Handle>,
@@ -145,10 +147,12 @@ impl Online {
             None => Task::none(),
         };
         let account = if omni.is_some() { AccountState::Resolving } else { AccountState::Guest { ran_out: false } };
+        let storage = omni.as_ref().map_or(SessionBackend::Unavailable, Omni::session_backend);
         let online = Self {
             omni,
             provider,
             kept: HashSet::new(),
+            storage,
             account,
             accounts: HashMap::new(),
             avatars: HashMap::new(),
@@ -168,6 +172,11 @@ impl Online {
 
     pub fn omni(&self) -> Option<&Omni> {
         self.omni.as_ref()
+    }
+
+    /// Where the session is kept this run: the keyring, a sealed file, or nowhere.
+    pub fn storage(&self) -> SessionBackend {
+        self.storage
     }
 
     /// The platform the online tabs show.
@@ -296,15 +305,17 @@ impl Online {
                 (Task::batch([self.load_playlists(&account), avatar, self.ensure_liked()]), true)
             }
             Message::Account(provider, Ok(None)) => {
-                let ran_out = self.kept.remove(provider);
-                let state = AccountState::Guest { ran_out };
+                // A kept session the platform no longer accepts is not a reason to destroy it: the
+                // next launch may find it valid again, and only 「退出登录」 should delete anything.
+                tracing::info!(provider, "kept session no longer accepted");
+                let state = AccountState::Guest { ran_out: true };
                 self.accounts.insert(provider, state.clone());
                 self.avatars.remove(provider);
                 if provider == self.provider {
                     self.account = state;
                     self.reset_feeds();
                 }
-                (self.forget(provider), provider == self.provider)
+                (Task::none(), provider == self.provider)
             }
             Message::Account(provider, Err(err)) => {
                 tracing::warn!(provider, error = %err, "online account unreadable");

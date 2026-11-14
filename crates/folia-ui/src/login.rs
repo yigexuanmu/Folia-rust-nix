@@ -857,6 +857,21 @@ impl Login {
         .into()
     }
 
+    /// `SessionNote`: where the session is kept, or that it cannot be kept at all. Nothing to say
+    /// when the keyring answers, since that is the promise the original makes.
+    fn session_note<'a>(look: &Look<'a>, tokens: Tokens) -> Option<Element<'a, Message>> {
+        let (key, color) = match look.online.storage() {
+            folia_omni::SessionBackend::Keyring => return None,
+            folia_omni::SessionBackend::Sealed => ("login.sessionSealed", tokens.t3),
+            folia_omni::SessionBackend::Unavailable => ("login.sessionUnavailable", tokens.t2),
+        };
+        Some(
+            container(text(look.i18n.t(key).to_owned()).size(crate::typeface::size::HINT).color(color))
+                .width(Length::Fill)
+                .into(),
+        )
+    }
+
     fn content<'a>(
         &'a self,
         look: &Look<'a>,
@@ -903,15 +918,20 @@ impl Login {
 
         let tile = self.tile(look, tokens, platform, signed_in, now);
         let message = self.message(look, tokens, platform, signed_in, now);
+        let note = Self::session_note(look, tokens);
         let main: Element<'a, Message> = if narrow {
-            column![
+            let mut stacked = column![
                 header,
                 container(self.platforms(look, tokens, true, now)).padding([0.0, 16.0]),
                 container(tile).center_x(Length::Fill),
                 container(message).padding(Padding { top: 0.0, right: 24.0, bottom: 20.0, left: 24.0 }),
             ]
-            .spacing(16)
-            .into()
+            .spacing(16);
+            if let Some(note) = note {
+                stacked =
+                    stacked.push(container(note).padding(Padding { top: 0.0, right: 24.0, bottom: 20.0, left: 24.0 }));
+            }
+            stacked.into()
         } else {
             let mut body = column![row![tile, message].spacing(24)].padding(Padding {
                 top: 82.0,
@@ -921,6 +941,9 @@ impl Login {
             });
             if let (Phase::Failed(failure), true) = (&self.phase, self.details_shown(signed_in)) {
                 body = body.push(details(look, tokens, label, failure));
+            }
+            if let Some(note) = note {
+                body = body.push(container(note).padding(Padding { top: 8.0, right: 0.0, bottom: 0.0, left: 0.0 }));
             }
             column![header, body].into()
         };

@@ -13,6 +13,7 @@
   dbus,
   libxkbcommon,
   sqlite,
+  systemd,
   vulkan-loader,
   wayland,
   libGL,
@@ -81,8 +82,10 @@ rustPlatform.buildRustPackage {
     install -Dm644 packaging/folia.desktop $out/share/applications/folia.desktop
     install -Dm644 assets/icon.png $out/share/icons/hicolor/512x512/apps/folia.png
 
+    # systemd-creds 在 PATH 上：密钥库不可用时，登录态靠它加密落盘。
     makeWrapper $out/libexec/folia/folia $out/bin/folia \
-      --prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath libraries}
+      --prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath libraries} \
+      --prefix PATH : ${lib.makeBinPath [ systemd ]}
 
     runHook postInstall
   '';
