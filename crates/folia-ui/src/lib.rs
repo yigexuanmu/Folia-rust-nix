@@ -262,6 +262,24 @@ pub enum Message {
     Timeline(timeline::Message),
 }
 
+impl Message {
+    /// Frames and pointer moves arrive at up to 60 Hz while dragging. None of them change what the
+    /// panel's data, the background, the prefetch queue or the visualizer seed are built from, so
+    /// rebuilding those on every move was pure allocation churn (and a steadily climbing RSS).
+    fn is_transient(&self) -> bool {
+        matches!(
+            self,
+            Message::Pointer(..)
+                | Message::ChromeTick
+                | Message::Settings(settings::Message::Frame)
+                | Message::Workbench(workbench::Message::Frame)
+                | Message::Library(library::Message::Frame)
+                | Message::Search(search::Message::Frame)
+                | Message::Developer(developer::Message::Tick)
+        )
+    }
+}
+
 impl From<folia_visualizer::styles::monet::Event> for Message {
     fn from(event: folia_visualizer::styles::monet::Event) -> Self {
         match event {
@@ -635,7 +653,10 @@ impl Shell {
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
-        self.refresh_panel_data();
+        let transient = message.is_transient();
+        if !transient {
+            self.refresh_panel_data();
+        }
         let before = self.page;
         let settles_page = matches!(message, Message::PageShot(_) | Message::PageShotDone);
         let seam_before = self.seam_before(&message);
@@ -647,9 +668,14 @@ impl Shell {
             Message::Playback(playback::Message::Tick) | Message::Workbench(workbench::Message::Frame)
         );
         let task = self.handle(message);
-        let task = Task::batch([task, self.prepare_background()]);
-        let task = Task::batch([task, self.playback.refresh_prefetch().map(Message::Playback)]);
-        self.refresh_visualizer_seed();
+        let task = if transient {
+            task
+        } else {
+            Task::batch([task, self.prepare_background(), self.playback.refresh_prefetch().map(Message::Playback)])
+        };
+        if !transient {
+            self.refresh_visualizer_seed();
+        }
         if self.page != before || self.playback.current().is_none() {
             self.play_navigation.cancel();
         }
@@ -2170,7 +2196,10 @@ impl Shell {
         if self.sources.has_alert() && self.settings.is_none() {
             parts.push(iced::event::listen_with(settings_key));
         }
-        if self.developer.log_open || self.settings.as_ref().is_some_and(settings::Settings::shows_developer) {
+        // No log panel exists while capture is off, so do not wake the whole settings page up for it.
+        if self.developer_settings.console_capture_enabled
+            && (self.developer.log_open || self.settings.as_ref().is_some_and(settings::Settings::shows_developer))
+        {
             parts.push(
                 iced::time::every(std::time::Duration::from_millis(400))
                     .map(|_| Message::Developer(developer::Message::Tick)),
@@ -2447,7 +2476,10 @@ impl Shell {
                 folder.map_or_else(Task::none, open_folder)
             }
             Message::Tick => {
-                if self.developer.log_open || self.settings.as_ref().is_some_and(settings::Settings::shows_developer) {
+                if self.developer_settings.console_capture_enabled
+                    && (self.developer.log_open
+                        || self.settings.as_ref().is_some_and(settings::Settings::shows_developer))
+                {
                     self.developer.refresh_log(&self.runtime_log);
                 }
                 if self.developer.memory_open {

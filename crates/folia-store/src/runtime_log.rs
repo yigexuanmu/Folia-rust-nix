@@ -76,11 +76,17 @@ impl RuntimeLog {
         self.inner.file.set(capture && file, mode);
         if !capture {
             self.inner.lines.lock().clear();
+            self.inner.next.fetch_add(1, Ordering::Relaxed);
         }
     }
 
     pub fn capture(&self) -> bool {
         self.inner.capture.load(Ordering::Relaxed)
+    }
+
+    /// Bumped whenever the in-memory lines change, so a viewer can skip a copy when nothing did.
+    pub fn revision(&self) -> u64 {
+        self.inner.next.load(Ordering::Relaxed)
     }
 
     pub fn path(&self) -> &Path {
@@ -110,6 +116,7 @@ impl RuntimeLog {
 
     pub fn clear(&self) {
         self.inner.lines.lock().clear();
+        self.inner.next.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Flushes the file when it is on; the panic hook calls this before the process ends.

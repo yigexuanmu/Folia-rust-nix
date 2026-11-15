@@ -18,6 +18,10 @@ use crate::settings_kit::{self as kit, Group, Row, Tokens};
 
 const LOG_HEIGHT: f32 = 352.0;
 const OVERLAY_LOG_HEIGHT: f32 = 416.0;
+/// The inline panel sits inside the settings page, which is rebuilt on every frame; a few dozen
+/// rows are enough there. The Alt+Shift+D overlay is opened on purpose and can show the full tail.
+const INLINE_LOG_ROWS: usize = 60;
+const OVERLAY_LOG_ROWS: usize = 400;
 const CHART_HEIGHT: f32 = 120.0;
 /// `DraggableDebugWindow`: `top-4 right-4`, and at least this much stays on screen.
 const ANCHOR: f32 = 16.0;
@@ -54,6 +58,8 @@ pub struct Developer {
     pub log_open: bool,
     pub memory_open: bool,
     pub lines: Vec<LogLine>,
+    /// The runtime log's revision the lines above were copied at.
+    log_revision: u64,
     pub hidden_targets: BTreeSet<String>,
     pub samples: Vec<MemorySample>,
     pub latest: Option<MemorySample>,
@@ -67,7 +73,14 @@ pub struct Developer {
 }
 
 impl Developer {
+    /// Copies the session log only when a line was added or the log was cleared. The developer
+    /// page ticks several times a second, and cloning a thousand lines each tick was pure churn.
     pub fn refresh_log(&mut self, log: &RuntimeLog) {
+        let revision = log.revision();
+        if revision == self.log_revision {
+            return;
+        }
+        self.log_revision = revision;
         self.lines = log.entries();
     }
 
@@ -217,7 +230,7 @@ pub fn settings_groups<'a>(
             label: i18n.t("options.debugLogsToFile").to_owned(),
             hint: Some(log.path().display().to_string()),
             sub: true,
-            below: Some(log_panel(i18n, tokens, developer, LOG_HEIGHT)),
+            below: Some(log_panel(i18n, tokens, developer, LOG_HEIGHT, INLINE_LOG_ROWS)),
             control: row![
                 kit::icon_button(tokens, Icon::FolderOpen, 15.0, dmsg(Message::OpenRuntimeFolder)),
                 kit::segmented_enabled(
@@ -343,6 +356,7 @@ pub fn log_panel<'a>(
     tokens: Tokens,
     developer: &'a Developer,
     height: f32,
+    limit: usize,
 ) -> Element<'a, crate::Message> {
     let visible = developer.visible().count();
     let total = developer.lines.len();
@@ -354,24 +368,22 @@ pub fn log_panel<'a>(
     let clear = pill(tokens, "Clear".to_owned(), false, dmsg(Message::ClearLog));
     let header = row![heading, space().width(Length::Fill), copy, clear].spacing(6).align_y(Alignment::Center);
 
-    let mut counts: Vec<(String, usize)> = Vec::new();
+    let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
     for line in &developer.lines {
-        match counts.iter_mut().find(|(target, _)| *target == line.target) {
-            Some((_, count)) => *count += 1,
-            None => counts.push((line.target.clone(), 1)),
-        }
+        *counts.entry(line.target.as_str()).or_insert(0) += 1;
     }
-    counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let mut counts: Vec<_> = counts.into_iter().collect();
+    counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
     let mut filters = row![].spacing(4).align_y(Alignment::Center);
     filters = filters.push(pill(tokens, "All".to_owned(), false, dmsg(Message::ToggleTarget(String::new()))));
     filters = filters.push(pill(tokens, "None".to_owned(), false, dmsg(Message::ToggleTarget("*".to_owned()))));
     for (target, count) in &counts {
-        let hidden = developer.hidden_targets.contains(target);
+        let hidden = developer.hidden_targets.contains(*target);
         filters = filters.push(pill(
             tokens,
             format!("{target} {count}"),
             !hidden,
-            dmsg(Message::ToggleTarget(target.clone())),
+            dmsg(Message::ToggleTarget((*target).to_owned())),
         ));
     }
     let filters = scrollable(filters)
@@ -381,7 +393,7 @@ pub fn log_panel<'a>(
     let mut list = column![].spacing(0);
     let mut shown = 0;
     for line in developer.visible().rev() {
-        if shown >= 400 {
+        if shown >= limit {
             break;
         }
         shown += 1;
@@ -452,7 +464,7 @@ pub fn log_overlay<'a>(
         return None;
     }
     let body = if settings.console_capture_enabled {
-        log_panel(i18n, tokens, developer, OVERLAY_LOG_HEIGHT)
+        log_panel(i18n, tokens, developer, OVERLAY_LOG_HEIGHT, OVERLAY_LOG_ROWS)
     } else {
         // `ConsoleLogPanel` with capture off.
         container(
@@ -715,5 +727,37 @@ impl canvas::Program<crate::Message> for Chart<'_> {
             frame.stroke(&path, Stroke::default().with_color(series.color()).with_width(1.5));
         }
         vec![frame.into_geometry()]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn log(name: &str) -> RuntimeLog {
+        RuntimeLog::new(std::env::temp_dir().join(format!("folia-log-{}-{name}.log", std::process::id())))
+    }
+
+    /// The page ticks several times a second; a quiet log must not copy a thousand lines each time.
+    #[test]
+    fn a_quiet_log_does_not_replace_the_viewers_lines() {
+        let log = log("revision");
+        let mut developer = Developer::default();
+        developer.refresh_log(&log);
+        assert!(developer.lines.is_empty());
+
+        log.push(Level::INFO, "folia", "started");
+        developer.refresh_log(&log);
+        assert_eq!(developer.lines.len(), 1);
+
+        // Same revision: the viewer keeps its snapshot, even if it was edited in the meantime.
+        developer.lines.clear();
+        developer.refresh_log(&log);
+        assert!(developer.lines.is_empty());
+        assert_eq!(developer.log_revision, log.revision());
+
+        log.clear();
+        developer.refresh_log(&log);
+        assert_eq!(developer.log_revision, log.revision());
     }
 }

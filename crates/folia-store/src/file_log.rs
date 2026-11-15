@@ -4,13 +4,15 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
 use std::time::Duration;
 
 use crate::developer::LogMode;
 use crate::log_file::LogFile;
 
 const SYNC_WAIT: Duration = Duration::from_secs(1);
+/// A slow disk must not let a log flood grow the queue without bound; newer lines are dropped first.
+const QUEUE_LIMIT: usize = 4096;
 
 enum Note {
     Set { enabled: bool, mode: LogMode },
@@ -26,13 +28,13 @@ enum Note {
 pub struct FileLog {
     path: PathBuf,
     enabled: Arc<AtomicBool>,
-    notes: Sender<Note>,
+    notes: SyncSender<Note>,
 }
 
 impl FileLog {
     /// Starts the writer thread without touching the disk; the file is opened by the first `set(true, ..)`.
     pub fn start(path: PathBuf, limit: usize) -> Self {
-        let (notes, inbox) = mpsc::channel();
+        let (notes, inbox) = mpsc::sync_channel(QUEUE_LIMIT);
         let enabled = Arc::new(AtomicBool::new(false));
         let state = enabled.clone();
         let owned = path.clone();
@@ -55,12 +57,15 @@ impl FileLog {
         let _ = self.notes.send(Note::Set { enabled, mode });
     }
 
-    /// Queues one line; nothing is allocated or sent while the log is off.
+    /// Queues one line; nothing is allocated or sent while the log is off. Drops it when the
+    /// writer has fallen behind, which keeps the queue (and the process's memory) bounded.
     pub fn write(&self, line: &str) {
         if !self.enabled.load(Ordering::Relaxed) {
             return;
         }
-        let _ = self.notes.send(Note::Line(line.to_owned()));
+        match self.notes.try_send(Note::Line(line.to_owned())) {
+            Ok(()) | Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {}
+        }
     }
 
     /// Waits until everything queued is on disk, at most one second.

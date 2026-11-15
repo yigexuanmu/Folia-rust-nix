@@ -33,7 +33,20 @@ struct Entry {
     raster: Arc<Raster>,
 }
 
+/// A fade changes the alpha on every frame. `Handle::from_rgba` gives each raster a unique id,
+/// so without this every frame of a fade would upload a brand new GPU texture. Quantising to 32
+/// levels keeps the fade smooth while bounding it to 32 rasters per text.
+fn quantized(look: Look) -> Look {
+    let step = |alpha: f32| (alpha * 32.0).round() / 32.0;
+    Look {
+        color: Color { a: step(look.color.a), ..look.color },
+        shadow: Color { a: step(look.shadow.a), ..look.shadow },
+        ..look
+    }
+}
+
 pub fn view<'a, M: 'a>(text: &str, look: Look) -> Element<'a, M> {
+    let look = quantized(look);
     static CACHE: OnceLock<Mutex<VecDeque<Entry>>> = OnceLock::new();
     let cache = CACHE.get_or_init(Mutex::default);
     let mut entries = cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -164,5 +177,38 @@ fn rasterize(text: &str, look: Look) -> Raster {
         height: height as f32 / scale,
         padding: padding as f32 / scale,
         bytes: width as usize * height as usize * 4,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fade produces a continuous alpha; the raster cache must see only a handful of looks.
+    #[test]
+    fn a_fade_shares_rasters_instead_of_making_one_per_frame() {
+        let look = Look {
+            font: Font::DEFAULT,
+            size: 20.0,
+            width: 800.0,
+            dpi: 1.0,
+            color: Color::from_rgba(1.0, 1.0, 1.0, 0.5),
+            shadow: Color::from_rgba(0.0, 0.0, 0.0, 0.2),
+            blur: false,
+            single: false,
+        };
+        let mut previous = None;
+        let mut keys = 0;
+        for frame in 0..128 {
+            let mut step = look;
+            step.color.a = frame as f32 / 128.0;
+            step.shadow.a = step.color.a * 0.4;
+            let key = quantized(step);
+            if Some(key) != previous {
+                keys += 1;
+                previous = Some(key);
+            }
+        }
+        assert!(keys <= 65, "128 fade frames should not need {keys} rasters");
     }
 }

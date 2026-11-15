@@ -18,6 +18,8 @@ use crate::wall_pan::{self, Gesture, Glide, Inertia, Pointer, Release, WheelSour
 use crate::wall_shift::{Kind, Pose, Shift};
 
 const CELL: f32 = 128.0;
+/// Typeset labels are cheap, but every distinct (tile, width) pair once stayed here forever.
+const LABEL_LIMIT: usize = 4096;
 const GAP: f32 = 8.0;
 const PITCH: f32 = CELL + GAP;
 const BLOCK_COLS: i32 = 12;
@@ -735,6 +737,13 @@ impl Wall {
     /// Typesets the labels of tiles on screen that have none yet; measuring text is too slow to do every frame.
     fn fit_visible(&mut self, tiles: &[Tile]) {
         let Some(typeset) = self.typeset else { return };
+        // The label map is the one cache keyed by a width that can vary with layout. Bound it:
+        // past this many entries, keep only the tiles on screen so repeated pans and reflows cannot
+        // accumulate typeset strings for every layout the wall ever had.
+        if self.labels.len() > LABEL_LIMIT {
+            let visible: HashSet<usize> = self.shown.iter().map(|place| place.track).collect();
+            self.labels.retain(|(track, _), _| visible.contains(track));
+        }
         for index in 0..self.shown.len() * 2 {
             let placement = self.shown[index / 2];
             // Each tile at rest, and where the focus card's reflow takes it.
