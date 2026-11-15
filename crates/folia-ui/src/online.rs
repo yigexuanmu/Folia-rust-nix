@@ -59,7 +59,7 @@ pub enum Message {
     Albums(String, Result<Vec<Collection>, String>),
     Radio(String, Result<RadioFeed, String>),
     Explore(String, Result<Vec<ExploreSection>, String>),
-    /// The answer to 「换一批」.
+    /// The answer to "Refresh".
     ExploreRefreshed(String, Result<Vec<ExploreSection>, String>),
     Avatar(&'static str, String, Option<folia_library::Cover>),
     /// The sync button's read came back: the account and the playlists kept with it.
@@ -105,7 +105,7 @@ pub struct Online {
     pub albums: Feed<Vec<Collection>>,
     pub radio: Feed<RadioFeed>,
     pub explore: Feed<Vec<ExploreSection>>,
-    /// 「换一批」 is on its way; the page on screen stays until it arrives.
+    /// "Refresh" is on its way; the page on screen stays until it arrives.
     pub explore_refreshing: bool,
     pub avatar: Option<iced::widget::image::Handle>,
     /// The platform whose sync button is reading.
@@ -306,7 +306,7 @@ impl Online {
             }
             Message::Account(provider, Ok(None)) => {
                 // A kept session the platform no longer accepts is not a reason to destroy it: the
-                // next launch may find it valid again, and only 「退出登录」 should delete anything.
+                // next launch may find it valid again, and only an explicit sign-out should delete anything.
                 tracing::info!(provider, "kept session no longer accepted");
                 let state = AccountState::Guest { ran_out: true };
                 self.accounts.insert(provider, state.clone());
@@ -616,7 +616,8 @@ impl Online {
         }
     }
 
-    /// 「换一批」 (`refresh`): the platform's page is read anew, every shelf handing out what it has not shown yet first.
+    /// "Refresh" (`refresh`): the platform's page is read anew, every shelf handing out what it
+    /// has not shown yet first.
     pub fn refresh_explore(&mut self) -> Task<Message> {
         let (Some(omni), Some(account)) = (self.omni.clone(), self.signed_in().cloned()) else { return Task::none() };
         if self.explore_refreshing || self.explore == Feed::Loading || self.explore == Feed::Idle {

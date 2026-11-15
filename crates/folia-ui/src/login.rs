@@ -136,7 +136,7 @@ impl Step {
     }
 }
 
-/// `DEFAULT_RETRY_WAIT_MS`: how long 「稍后再试」 waits when the platform names no time.
+/// `DEFAULT_RETRY_WAIT_MS`: how long the original's "Try later" state waits when the platform names no time.
 const RETRY_WAIT: Duration = Duration::from_secs(20);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

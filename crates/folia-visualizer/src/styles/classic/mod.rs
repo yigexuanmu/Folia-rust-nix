@@ -1,4 +1,4 @@
-// Classic (流光): one line at a time; each word springs in, glows while sung and drifts once passed.
+// Classic: one line at a time; each word springs in, glows while sung and drifts once passed.
 
 mod layout;
 mod tuning;

@@ -1,4 +1,4 @@
-// Lumiere (绘光): a dark stage, volumetric shafts and a small window of lyrics lit by those shafts.
+// Lumiere: a dark stage, volumetric shafts and a small window of lyrics lit by those shafts.
 
 mod art;
 mod audio;

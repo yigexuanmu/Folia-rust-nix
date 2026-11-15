@@ -1,11 +1,14 @@
-// 音源兜底（歌曲解锁）：平台不给地址、或只肯给一段试听时，按设置里的顺序去第三方音源取整首的地址。
+// Audio source fallback: when a platform withholds the full track or serves only a preview, ask the
+// third-party sources in the configured order for a playable URL.
 //
-// 三个音源移植自 fork 的 `songUnlockService.ts`，行为保持一致：
-//   · 网易云 —— 第三方聚合 API，按网易云自己的歌曲 id 查；
-//   · 波点 —— 酷我 bd-api，先用关键词在酷我搜到同一首歌，再要 320kbps 的地址（先上报一次广告观看）；
-//   · 酷我 —— 酷我移动端接口，同一首歌的 rid，DES 签名后取 128kbps 的地址。
+// Ported from the fork's `songUnlockService.ts`, with the same three sources and behaviour:
+//   - NetEase: a third-party aggregate API, looked up by the NetEase song id.
+//   - Bodian: Kuwo's bd-api; finds the same song by keyword, then asks for the 320 kbps URL after
+//     reporting an ad view.
+//   - Kuwo: the mobile API; the same song's rid, signed with DES, for the 128 kbps URL.
 //
-// 这里只负责把地址拿回来：要不要用、怎么放进缓存与音质档位，由调用方决定。
+// This module only returns URLs. Whether to use one, and how it enters the cache and quality
+// tiers, is the caller's decision.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -17,28 +20,28 @@ use serde_json::Value;
 
 mod des;
 
-/// 任何一个音源最多等这么久，超过就换下一个。
+/// Give up on one source after this long; a stalled source must not hold up the rest.
 const SOURCE_TIMEOUT: Duration = Duration::from_secs(12);
-/// 搜索关键字里歌名与歌手之间的分隔。
+/// Separates title and artist in the search keyword.
 const KEYWORD_SEPARATOR: &str = " - ";
-/// 酷我移动端接口的固定密钥与安装包名，同 fork。
+/// Fixed key and package name of Kuwo's mobile API, from the fork.
 const KUWO_DES_KEY: &[u8; 8] = b"ylzsxkwm";
 const KUWO_PACKAGE: &str = "kwplayer_ar_5.1.0.0_B_jiakong_vh.apk";
-/// 波点取地址前要先上报一次广告观看，参数与签名都写死（同 fork 用的那一次）。
+/// Bodian needs an ad-view report before it hands out a URL; the fork's parameters and signature are fixed.
 const BODIAN_ADVERT: &str =
     "/api/service/advert/watch?uid=-1&token=&timestamp=1724306124436&sign=15a676d66285117ad714e8c8371691da";
 const BODIAN_AUDIO: &str = "/api/play/music/v2/audioUrl";
 
-/// 三个音源所在的地址；测试把它们指向本地服务器。
+/// Endpoints for the three sources; tests point them at a local server.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Endpoints {
-    /// 网易云的第三方聚合 API。
+    /// The third-party aggregate API for NetEase.
     pub netease: String,
-    /// 酷我的搜索接口，波点与酷我两路共用。
+    /// Kuwo search, shared by the Bodian and Kuwo sources.
     pub kuwo_search: String,
-    /// 酷我 bd-api，波点音乐走这里。
+    /// Kuwo's bd-api, used by Bodian.
     pub bodian: String,
-    /// 酷我移动端接口。
+    /// Kuwo's mobile API.
     pub kuwo_mobile: String,
 }
 
@@ -53,7 +56,7 @@ impl Default for Endpoints {
     }
 }
 
-/// 一个音源交出来的整首地址。
+/// A full-track URL returned by one of the fallback sources.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Unlocked {
     pub url: String,
@@ -70,19 +73,19 @@ impl Unlock {
         Self { http, endpoints: Endpoints::default() }
     }
 
-    /// 换一套地址，测试用。
+    /// Overrides the endpoints so tests can use a local server.
     pub fn with_endpoints(http: reqwest::Client, endpoints: Endpoints) -> Self {
         Self { http, endpoints }
     }
 
-    /// 按设置里的顺序问每个启用的音源，第一个给出整首地址的就是答案；都不给就返回 `None`。
+    /// Asks each enabled source in the configured order and takes the first full-track URL; `None` when none answer.
     pub async fn source(&self, track: &Track, settings: &UnlockSettings) -> Option<Unlocked> {
         let order = settings.order();
         if order.is_empty() {
             return None;
         }
         let wanted = keyword(track);
-        // 两路酷我音源都要先在酷我的目录里找到同一首歌：找到一次就够，没找到也是。
+        // Both Kuwo-backed sources need the same song's rid; one lookup is enough, including a miss.
         let mut matched: Option<Option<String>> = None;
         for source in order {
             let found = match source {
@@ -114,7 +117,8 @@ impl Unlock {
         None
     }
 
-    /// 聚合 API 索引的是网易云的曲库：别的平台的 id 问过去只会是另一首歌，所以只有网易云的歌才问它。
+    /// The aggregate API indexes NetEase's catalogue: another platform's id resolves to a
+    /// different song, so only NetEase tracks are asked.
     async fn netease(&self, track: &Track) -> Option<Unlocked> {
         let song = track.online.as_ref().filter(|song| song.provider == "netease")?;
         let address = with_query(&self.endpoints.netease, &[("types", "url"), ("id", song.id.as_str())])?;
@@ -123,11 +127,11 @@ impl Unlock {
         Some(Unlocked { url: url.to_owned(), source: UnlockSource::Netease })
     }
 
-    /// 波点的 320kbps mp3：地址由 bd-api 签名后给出。
+    /// Bodian's 320 kbps mp3, signed by bd-api.
     async fn bodian(&self, music_id: &str) -> Option<Unlocked> {
         let query = format!("br=320kmp3&musicId={music_id}&timestamp={}", millis());
         let sign = kuwotest_sign(&query, BODIAN_AUDIO);
-        // 观看广告这一步的结果 fork 也不看：拿不到地址就当这一个音源没有。
+        // The fork ignores the ad-view response too: without a URL this source has no answer.
         let advert = self
             .http
             .post(format!("{}{BODIAN_ADVERT}", self.endpoints.bodian))
@@ -153,7 +157,7 @@ impl Unlock {
         Some(Unlocked { url: url.to_owned(), source: UnlockSource::Bodian })
     }
 
-    /// 酷我移动端的 128kbps mp3：查询串 DES 加密后放进 `q`。
+    /// Kuwo's 128 kbps mp3 from the mobile API, with the query DES-encrypted into `q`.
     async fn kuwo(&self, music_id: &str) -> Option<Unlocked> {
         let query = format!("corp=kuwo&source={KUWO_PACKAGE}&p2p=1&type=convert_url2&sig=0&format=mp3&rid={music_id}");
         let sealed = kw_query(&query);
@@ -172,7 +176,7 @@ impl Unlock {
         Some(Unlocked { url: first_url(&answer)?, source: UnlockSource::Kuwo })
     }
 
-    /// 在酷我的搜索结果里找同一首歌，给出它的 rid。
+    /// Finds the same song in Kuwo's search results and returns its rid.
     async fn kuwo_id(&self, track: &Track, keyword: &str) -> Option<String> {
         let address = with_query(
             &self.endpoints.kuwo_search,
@@ -205,7 +209,7 @@ impl Unlock {
     }
 }
 
-/// 问名字用的关键字：`歌名 - 歌手`，没有歌手时只有歌名。
+/// Search keyword: `title - artist`, or just the title when the artist is unknown.
 pub fn keyword(track: &Track) -> String {
     match &track.artist {
         Some(artist) if !artist.trim().is_empty() => format!("{}{KEYWORD_SEPARATOR}{artist}", track.title),
@@ -213,7 +217,8 @@ pub fn keyword(track: &Track) -> String {
     }
 }
 
-/// 搜索结果是不是要找的那首歌：歌名去掉括号注释后互相包含；两边都有歌手时，歌手也要互相包含。
+/// Whether a search hit is the same song: titles must contain each other after parenthetical
+/// notes are dropped, and so must artists when both are known.
 pub fn matches_song(
     found_name: &str,
     found_artist: Option<&str>,
@@ -238,7 +243,7 @@ pub fn matches_song(
     }
 }
 
-/// 歌名的小写形式，去掉 `(…)` 与 `（…）` 里的注释；括号没有合上时原样留着。
+/// Lower-cased title without `(…)` / `（…）` notes; an unclosed parenthesis stays verbatim.
 fn bare_name(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     let mut rest = name.chars().flat_map(char::to_lowercase).peekable();
@@ -248,7 +253,7 @@ fn bare_name(name: &str) -> String {
             continue;
         }
         match rest.clone().position(|next| next == ')' || next == '）') {
-            // 注释到第一个右括号为止，连同括号一起丢掉。
+            // Drop the note up to the first closing parenthesis, brackets included.
             Some(index) => rest.by_ref().take(index + 1).for_each(drop),
             None => out.push(ch),
         }
@@ -256,7 +261,7 @@ fn bare_name(name: &str) -> String {
     out.trim().to_owned()
 }
 
-/// 歌手名的小写形式，`& / 、 ， , ; ；` 都算分隔，空白收成一个空格。
+/// Lower-cased artist, with `& / 、 ， , ; ；` as separators and whitespace collapsed to one space.
 fn bare_artist(artist: &str) -> String {
     let spaced: String = artist
         .chars()
@@ -266,8 +271,8 @@ fn bare_artist(artist: &str) -> String {
     spaced.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// 酷我移动端查询串的签名：酷我那版 DES（见 `des.rs`）逐块加密，固定密钥，补零到整块
-/// （正好整块时再补一整块），再 base64。
+/// Signs a Kuwo mobile query: Kuwo's DES variant (see `des.rs`) over zero-padded blocks with a
+/// fixed key, then base64. An exact multiple of eight bytes gets a whole extra block.
 pub fn kw_query(query: &str) -> String {
     let mut bytes = query.as_bytes().to_vec();
     let remainder = bytes.len() % 8;
@@ -280,14 +285,14 @@ pub fn kw_query(query: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(&bytes)
 }
 
-/// bd-api 的签名：查询串里只留字母数字、排序，前面加 `kuwotest`，后面接路径，取 MD5。
+/// bd-api signature: keep the query's alphanumerics, sort them, prefix `kuwotest`, append the path, take MD5.
 fn kuwotest_sign(query: &str, path: &str) -> String {
     let mut chars: Vec<char> = query.chars().filter(char::is_ascii_alphanumeric).collect();
     chars.sort_unstable();
     md5_hex(&format!("kuwotest{}{path}", chars.into_iter().collect::<String>()))
 }
 
-/// bd-api 要的移动端请求头；设备号每次启动换一个。
+/// Mobile headers bd-api expects; the device id changes each launch.
 fn bodian_headers() -> reqwest::header::HeaderMap {
     use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
     let mut headers = HeaderMap::new();
@@ -310,12 +315,12 @@ fn bodian_headers() -> reqwest::header::HeaderMap {
     headers
 }
 
-/// 把查询参数拼到地址上：`reqwest` 的 `.query()` 要额外的特性开关，这里直接拼。
+/// `reqwest`'s `.query()` needs a separate feature, so build the query into the URL here.
 fn with_query(base: &str, params: &[(&str, &str)]) -> Option<reqwest::Url> {
     reqwest::Url::parse_with_params(base, params).ok()
 }
 
-/// 响应正文里第一个地址：酷我移动端把地址包在一段文本里。
+/// First URL in the body: Kuwo's mobile API wraps it in a text response.
 fn first_url(text: &str) -> Option<String> {
     let start = text.find("http")?;
     let url: String = text[start..].chars().take_while(|ch| !ch.is_whitespace() && *ch != '$' && *ch != '"').collect();
@@ -330,7 +335,7 @@ fn md5_hex(text: &str) -> String {
     Md5::digest(text.as_bytes()).iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// 每次启动一个设备号，同 fork 的随机数字串。
+/// A fresh device id per launch, a random digit string as in the fork.
 fn device_id() -> String {
     use std::hash::{BuildHasher, Hasher};
     let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
@@ -338,7 +343,7 @@ fn device_id() -> String {
     format!("{}", hasher.finish() % 100_000_000_000)
 }
 
-/// 地址里的文件扩展名，拿不准时按 mp3 算：下载下来的文件名要用它。
+/// Extension taken from the URL, defaulting to mp3: the downloaded file name needs it.
 pub fn audio_extension(url: &str) -> String {
     const KNOWN: [&str; 7] = ["mp3", "m4a", "flac", "aac", "wav", "ogg", "opus"];
     let path = url.split(['?', '#']).next().unwrap_or(url);

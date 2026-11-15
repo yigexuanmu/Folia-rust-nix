@@ -72,7 +72,7 @@ pub struct Layer {
     pub list_hover: Option<usize>,
     /// The album poster's cover (512px), colours from the cover, release time and composition.
     pub poster: Option<Poster>,
-    /// 「过滤当前页」 was pressed on the poster: the seam shows the filter instead (`openBravaisFilter`).
+    /// "Filter this page" was pressed on the poster: the seam shows the filter instead (`openBravaisFilter`).
     pub filter_open: bool,
 }
 
@@ -200,7 +200,7 @@ pub enum Effect {
     },
     /// The focus card's play on the playing song: pause or resume.
     Toggle,
-    /// The focus card's 「进入」: the playing page.
+    /// The focus card's "Enter": the playing page.
     EnterPlayer,
     /// The focus card's queue button: added, or moved to the end when queued (`applyQueueAddBehavior`).
     EnqueueOne(Track),
@@ -226,9 +226,9 @@ pub struct LibraryPage {
     pub layer: Option<Layer>,
     tiles: Vec<Tile>,
     actions: Vec<Action>,
-    /// Where the playing queue was started, for 「定位」 (`playingSongLocator`).
+    /// Where the playing queue was started, for "Locate" (`playingSongLocator`).
     source: Option<Source>,
-    /// The song to centre on once the collection being opened for 「定位」 has its tracks.
+    /// The song to centre on once the collection being opened for "Locate" has its tracks.
     locating: Option<i64>,
     /// The player bar's safe area at the bottom, which a revealed card stays above.
     pub bottom_inset: f32,
@@ -258,7 +258,7 @@ pub enum Message {
     Picked(Option<PathBuf>),
     Reload,
     RefreshExplore,
-    /// 「定位」: back to the wall the queue came from, centred on the song with this id.
+    /// "Locate": back to the wall the queue came from, centred on the song with this id.
     Locate(i64),
     Loaded(Result<Vec<Track>, String>),
     Wall(wall::Message),
@@ -269,7 +269,7 @@ pub enum Message {
     /// The album poster's cover at 512px, and the colours read from it at 128px.
     PosterCover(String, Option<iced::widget::image::Handle>),
     PosterPalette(String, Option<crate::poster::Palette>),
-    /// 「过滤当前页」 on the poster.
+    /// "Filter this page" on the poster.
     OpenFilter,
     /// Enter in the filter: editing ends and the wall takes the keyboard focus (`focusFirst`).
     FilterSubmit,
@@ -607,7 +607,7 @@ impl LibraryPage {
     }
 
     /// Moves the wall so the local song at `index` is in the middle.
-    /// 「定位」: shows the wall the queue was started from, opening its collection again if need be, and
+    /// "Locate": shows the wall the queue was started from, opening its collection again if need be, and
     /// centres the camera on the song's copy nearest it (`useBravaisLocate`).
     fn locate(&mut self, track: i64, i18n: &I18n) -> (Task<Message>, Option<Effect>) {
         match self.source.clone() {

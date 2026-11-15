@@ -1,4 +1,4 @@
-// Bodian (波点音乐) over its desktop API: search, play rights, word-timed lyrics, QR sign-in, lists and radio.
+// Bodian over its desktop API: search, play rights, word-timed lyrics, QR sign-in, lists and radio.
 
 mod api;
 mod library;

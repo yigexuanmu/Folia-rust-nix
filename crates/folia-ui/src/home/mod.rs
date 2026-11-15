@@ -152,9 +152,9 @@ pub enum Message {
     Search,
     /// The panel's query field changed.
     SearchQuery(String),
-    /// Enter or 「搜索」: the panel hands `SearchQuery` to the search page.
+    /// Enter or the "Search" button: the panel hands `SearchQuery` to the search page.
     SubmitSearch,
-    /// 「关闭搜索」, × or Escape: only the panel shuts.
+    /// "Close search", × or Escape: only the panel shuts.
     CloseSearch,
     /// Escape while the search field has focus; an IME composition keeps it.
     EscapeSearch,
@@ -164,7 +164,7 @@ pub enum Message {
     Player,
     Import,
     Reload,
-    /// 「换一批」 on the explore tab.
+    /// "Refresh" on the explore tab.
     RefreshExplore,
     Dismiss,
     Frame,
@@ -181,7 +181,7 @@ pub enum Message {
     EnqueueAll,
     Query(String),
     OpenList,
-    /// 「过滤当前页」 on the album poster.
+    /// "Filter this page" on the album poster.
     OpenFilter,
     /// Where the poster's cover canvas is on screen.
     PosterCover(iced::Rectangle),
@@ -856,7 +856,7 @@ pub struct Host<'a> {
     pub daylight: bool,
     pub has_track: bool,
     pub busy: bool,
-    /// The explore tab's 「换一批」 (`refresh-explore`): `Some(enabled)` while the tab shows the page.
+    /// The explore tab's "Refresh" (`refresh-explore`): `Some(enabled)` while the tab shows the page.
     pub explore_refresh: Option<bool>,
     pub volume: f32,
     pub muted: bool,
@@ -917,7 +917,7 @@ pub struct LayerSeam {
     pub album: Option<AlbumSeam>,
 }
 
-/// The collection's filter input, focused when the poster's 「过滤当前页」 opens it (`openBravaisFilter`).
+/// The collection's filter input, focused when the poster's "Filter this page" opens it (`openBravaisFilter`).
 pub fn filter_id() -> iced::widget::Id {
     iced::widget::Id::new("bravais-collection-filter")
 }
@@ -944,7 +944,7 @@ pub struct AlbumSeam {
     pub palette: crate::poster::Palette,
     pub composition: crate::poster::Composition,
     pub cover: Option<iced::widget::image::Handle>,
-    /// 「专辑 · 年份」.
+    /// "Album · Year".
     pub kicker: String,
     pub artists: String,
     pub facts: Vec<String>,

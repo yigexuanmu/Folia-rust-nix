@@ -1,8 +1,9 @@
-# Folia-rust：一个二进制加 Nebbia 的笔画数据。
+# Folia-rust: one binary plus the Nebbia stroke data.
 #
-# 系统库按 Linux 需要给：cpal 要 alsa，keyring 走 secret-service（dbus），winit 要 libxkbcommon，
-# wgpu 在运行时找 vulkan/GL 驱动。nixpkgs 的 cargo 钩子还会让 aws-lc-sys、libsqlite3-sys、zstd-sys
-# 链系统库（AWS_LC_SYS_USE_SYSTEM=1 等），所以这几样既是构建依赖也是运行时依赖。
+# Linux runtime libraries: cpal needs alsa, keyring uses the Secret Service over dbus, winit needs
+# libxkbcommon, and wgpu finds the vulkan/GL drivers at runtime. The nixpkgs cargo hook also forces
+# aws-lc-sys, libsqlite3-sys and zstd-sys to link system libraries (`AWS_LC_SYS_USE_SYSTEM=1` and
+# friends), so these are both build inputs and runtime dependencies.
 {
   lib,
   rustPlatform,
@@ -22,7 +23,7 @@
 }:
 
 let
-  # 构建时要 -L 到、运行时也要能找到的库：wrapper 的 LD_LIBRARY_PATH 用的是同一份。
+  # Libraries needed by the linker at build time and by the loader at runtime; the wrapper uses the same list.
   libraries = [
     alsa-lib
     aws-lc
@@ -41,13 +42,13 @@ rustPlatform.buildRustPackage {
 
   inherit src;
 
-  # Cargo.lock 是提交进仓库的，依赖固定；工作区里的 test/ 不在 members 里，不参与构建。
+  # Cargo.lock is committed, so dependencies are fixed; test/ is a separate workspace, not a member.
   cargoLock.lockFile = "${src}/Cargo.lock";
   cargoBuildFlags = [
     "--package"
     "folia-app"
   ];
-  # 测试工程是独立的 workspace（test/Cargo.toml），这里只打包，不跑它的用例。
+  # The tests live in their own workspace (test/Cargo.toml); this derivation only packages the app.
   doCheck = false;
 
   nativeBuildInputs = [
@@ -61,28 +62,31 @@ rustPlatform.buildRustPackage {
   installPhase = ''
     runHook preInstall
 
-    # 构建钩子总带 --target，产物落在 target/<三元组>/release 下；没有三元组时在 target/release。
+    # The cargo hook always passes --target, so the binary lands in target/<triple>/release;
+    # fall back to target/release.
     binary=target/release/folia
     if [ ! -x "$binary" ]; then
       binary="$(ls -d target/*/release/folia | head -n 1)"
     fi
 
-    # 二进制与其数据放在同一层：nebbia 的笔画文件先按工作目录找，再找可执行文件旁边。
+    # Keep the binary and its data together: Nebbia looks for stroke files in the working
+    # directory first, then beside the executable.
     install -Dm755 "$binary" $out/libexec/folia/folia
     install -Dm644 assets/nebbia/nebbia-strokes.bin.gz $out/libexec/folia/assets/nebbia/nebbia-strokes.bin.gz
 
-    # 只有 Arphic 授权的笔画数据与许可正文是单独文件，其余资源都编进了二进制。
+    # Only the Arphic-licensed stroke data and licence texts are separate files; every other
+    # asset is compiled into the binary.
     for file in LICENSE assets/nebbia/NOTICE.txt assets/nebbia/COPYING.txt assets/nebbia/ARPHICPL.TXT; do
       install -Dm644 "$file" "$out/share/doc/folia/$(basename "$file")"
     done
 
-    # 桌面菜单项：.desktop 与图标一起装，装完就能在应用列表里点到。
-    # 图标名与 desktop 里的 Icon= 一致（folia），StartupWMClass 也取 folia——
-    # winit 在 X11 上把 argv[0] 的文件名写进 WM_CLASS，wrapper 与真实二进制同名。
+    # Install the desktop entry and icon together so the app appears in launchers.
+    # The icon name matches `Icon=` in the .desktop file (folia), and StartupWMClass is folia too:
+    # winit writes the basename of argv[0] into WM_CLASS on X11, and the wrapper has the same name.
     install -Dm644 packaging/folia.desktop $out/share/applications/folia.desktop
     install -Dm644 assets/icon.png $out/share/icons/hicolor/512x512/apps/folia.png
 
-    # systemd-creds 在 PATH 上：密钥库不可用时，登录态靠它加密落盘。
+    # systemd-creds must be on PATH: when the keyring is unavailable, sessions are sealed with it.
     makeWrapper $out/libexec/folia/folia $out/bin/folia \
       --prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath libraries} \
       --prefix PATH : ${lib.makeBinPath [ systemd ]}

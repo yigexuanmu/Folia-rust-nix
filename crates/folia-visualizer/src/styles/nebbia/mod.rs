@@ -1,4 +1,4 @@
-// Nebbia (雾笺): a rainy night street behind glass, lyrics wiped into the fog.
+// Nebbia: a rainy night street behind glass, lyrics wiped into the fog.
 // Small rain follows the vocal band. Drum hits are not analysed, so the bus keeps its idle sway.
 
 mod cache;

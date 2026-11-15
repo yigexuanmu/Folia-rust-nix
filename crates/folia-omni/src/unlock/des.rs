@@ -1,11 +1,13 @@
-// 酷我移动端用的那一版 DES。
+// The DES variant used by Kuwo's mobile API.
 //
-// 这里**不是**标准 DES：E 展开与 P 置换已经折进按字节对齐的置换表里，S 盒与 P 置换又合并成了
-// `NS_BOXES`（八张 64 项的表，下标是每个字节低六位的分组值），整块还按小端读写。酷我的服务端按
-// 同一套变换解，所以这里照 fork 的 `kwDESCrypt` 逐表搬，不做「标准化」。
+// This is NOT standard DES: the E expansion and P permutation are folded into byte-aligned tables,
+// the S-boxes and P permutation are merged into `NS_BOXES` (eight 64-entry tables indexed by the
+// low six bits of each byte), and whole blocks are read and written little-endian. Kuwo's server
+// inverts the same transform, so the tables are copied verbatim from the fork's `kwDESCrypt`
+// rather than being "standardised".
 //
-// 位运算全在 u64 上：fork 用 BigInt 只是 JS 没有 64 位整数。`TABLE[i] < 0` 的那几位是表里刻意留的
-// 空位，变换时跳过并补 0。
+// Bit operations stay in u64; the fork's BigInt only exists because JS lacks 64-bit integers.
+// Entries where `TABLE[i] < 0` are deliberate holes in the tables, skipped and filled with 0.
 
 const IP: [i8; 64] = [
     57, 49, 41, 33, 25, 17, 9, 1, 59, 51, 43, 35, 27, 19, 11, 3, 61, 53, 45, 37, 29, 21, 13, 5, 63, 55, 47, 39, 31, 23,
@@ -17,7 +19,7 @@ const IP_INVERSE: [i8; 64] = [
     60, 28, 35, 3, 43, 11, 51, 19, 59, 27, 34, 2, 42, 10, 50, 18, 58, 26, 33, 1, 41, 9, 49, 17, 57, 25, 32, 0, 40, 8,
     48, 16, 56, 24,
 ];
-/// 32 位扩成 64 位：每 6 位占一个字节的低六位，高两位留空（`-1`）。
+/// Expands 32 bits to 64: each 6-bit group sits in the low six bits of a byte, leaving two holes (`-1`).
 const E: [i8; 64] = [
     31, 0, 1, 2, 3, 4, -1, -1, 3, 4, 5, 6, 7, 8, -1, -1, 7, 8, 9, 10, 11, 12, -1, -1, 11, 12, 13, 14, 15, 16, -1, -1,
     15, 16, 17, 18, 19, 20, -1, -1, 19, 20, 21, 22, 23, 24, -1, -1, 23, 24, 25, 26, 27, 28, -1, -1, 27, 28, 29, 30, 31,
@@ -31,17 +33,17 @@ const PC1: [i8; 56] = [
     56, 48, 40, 32, 24, 16, 8, 0, 57, 49, 41, 33, 25, 17, 9, 1, 58, 50, 42, 34, 26, 18, 10, 2, 59, 51, 43, 35, 62, 54,
     46, 38, 30, 22, 14, 6, 61, 53, 45, 37, 29, 21, 13, 5, 60, 52, 44, 36, 28, 20, 12, 4, 27, 19, 11, 3,
 ];
-/// 56 位再选回 64 位里的 48 个有效位，同样是每 8 位留空两位。
+/// Selects the 48 significant bits of 56 back into 64, again with two holes per 8 bits.
 const PC2: [i8; 64] = [
     13, 16, 10, 23, 0, 4, -1, -1, 2, 27, 14, 5, 20, 9, -1, -1, 22, 18, 11, 3, 25, 7, -1, -1, 15, 6, 26, 19, 12, 1, -1,
     -1, 40, 51, 30, 36, 46, 54, -1, -1, 29, 39, 50, 44, 32, 47, -1, -1, 43, 48, 38, 55, 33, 52, -1, -1, 45, 41, 49, 35,
     28, 31, -1, -1,
 ];
 const SHIFTS: [u32; 16] = [1, 1, 2, 2, 2, 2, 2, 2, 1, 2, 2, 2, 2, 2, 2, 1];
-/// 按轮转位数取的掩码，配合 `SHIFTS` 只移动要移的那几位。
+/// Masks for the rotation counts, so `SHIFTS` only moves the bits that matter.
 const SHIFT_MASKS: [u64; 3] = [0, 0x10_0001, 0x30_0003];
 
-/// 八张 64 项的表：S 盒查表与 P 置换合成一步，下标是 `E` 出来的字节。
+/// Eight 64-entry tables merging the S-box lookup and P permutation, indexed by `E`'s bytes.
 const NS_BOXES: [[u8; 64]; 8] = [
     [
         14, 4, 3, 15, 2, 13, 5, 3, 13, 14, 6, 9, 11, 2, 0, 5, 4, 1, 10, 12, 15, 6, 9, 10, 1, 8, 12, 7, 8, 11, 7, 0, 0,
@@ -77,7 +79,7 @@ const NS_BOXES: [[u8; 64]; 8] = [
     ],
 ];
 
-/// 一位一位地按表搬家：`table[i]` 是源里从低位数起的第几位，结果放在第 `i` 位。
+/// Permutes bit by bit: `table[i]` names the source bit counted from the low end, placed at bit `i`.
 fn bit_transform(table: &[i8], source: u64) -> u64 {
     let mut out = 0_u64;
     for (index, &position) in table.iter().enumerate() {
@@ -101,7 +103,7 @@ fn subkeys(key: u64) -> [u64; 16] {
     keys
 }
 
-/// 一个 8 字节块：`key` 与 `block` 都是小端读出来的 u64，结果也按小端写成字节。
+/// One 8-byte block: `key` and `block` are little-endian u64s, and the result is written back little-endian.
 pub fn encrypt_block(key: u64, block: u64) -> u64 {
     let keys = subkeys(key);
     let permuted = bit_transform(&IP, block);
@@ -109,7 +111,7 @@ pub fn encrypt_block(key: u64, block: u64) -> u64 {
     let mut right = permuted >> 32;
     for round in keys {
         let mut mixed = bit_transform(&E, right) ^ round;
-        // 八个字节分组查表，最后一组在最前面：表里已经把 P 置换折进去了。
+        // Look up the eight bytes as groups, last group first: P is already folded into the tables.
         let mut substituted = 0_u64;
         for box_index in (0..8).rev() {
             let group = ((mixed >> (8 * box_index)) & 0xFF) as usize;
@@ -118,6 +120,6 @@ pub fn encrypt_block(key: u64, block: u64) -> u64 {
         mixed = bit_transform(&P, substituted);
         (left, right) = (right, left ^ mixed);
     }
-    // fork 在收尾前又换回一次半块顺序，所以高半块是 left。
+    // The fork swaps the halves back before finishing, so the high half is `left`.
     bit_transform(&IP_INVERSE, (left << 32) | (right & 0xFFFF_FFFF))
 }

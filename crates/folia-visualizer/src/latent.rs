@@ -1,4 +1,4 @@
-// Latent (隐现): a mesh gradient under a warp dither, cover colours falling back to the theme.
+// Latent: a mesh gradient under a warp dither, cover colours falling back to the theme.
 
 use std::cell::Cell;
 #[cfg(feature = "dev")]

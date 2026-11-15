@@ -435,11 +435,11 @@ pub fn adjacent(
 /// What the card's buttons do.
 #[derive(Debug, Clone)]
 pub enum Action {
-    /// 「立即播放」, or pause / resume on the playing song.
+    /// The original's "Play now", or pause / resume on the playing song.
     Play,
-    /// 「进入」: the playing page.
+    /// The original's "Enter": the playing page.
     Enter,
-    /// 「加入队列」, or moving it to the end when it is queued already.
+    /// The original's "Add to queue", or moving it to the end when it is queued already.
     Enqueue,
 }
 
@@ -546,7 +546,7 @@ pub fn body<'a>(i18n: &'a I18n, card: Card<'a>, reveal: (f32, f32)) -> Element<'
             Some(i18n.t("libraryBravais.enterPlayer").to_owned()),
         ));
     }
-    // 「已在队列」 shows 「插入队列」 on hover (`has-hover-label`); the playing song only ever says it is queued.
+    // "Queued" shows "Insert into queue" on hover (`has-hover-label`); the playing song only ever says it is queued.
     let (glyph, label) =
         if card.queued { (Icon::Check, "libraryBravais.inQueue") } else { (Icon::Plus, "libraryBravais.addToQueue") };
     let queue_face = row![

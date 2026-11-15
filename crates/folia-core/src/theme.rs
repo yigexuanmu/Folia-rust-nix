@@ -50,7 +50,7 @@ pub struct Theme {
 }
 
 impl Theme {
-    /// "Midnight Default" (午夜墨染), the original dark preset.
+    /// "Midnight Default", the original dark preset.
     pub const MIDNIGHT: Theme = Theme {
         name: Cow::Borrowed("Midnight Default"),
         background: Rgb::hex(0x09090b),
@@ -63,7 +63,7 @@ impl Theme {
         description: None,
     };
 
-    /// "Daylight Default" (日光素白), the original light preset.
+    /// "Daylight Default", the original light preset.
     pub const DAYLIGHT: Theme = Theme {
         name: Cow::Borrowed("Daylight Default"),
         background: Rgb::hex(0xf5f5f4),

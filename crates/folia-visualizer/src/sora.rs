@@ -1,4 +1,4 @@
-// Sora (空): 150 stars drifting on a black night field or a white daylight field.
+// Sora: 150 stars drifting on a black night field or a white daylight field.
 
 use std::cell::Cell;
 #[cfg(feature = "dev")]

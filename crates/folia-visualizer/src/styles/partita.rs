@@ -1,4 +1,5 @@
-// Partita (组曲): the line split into staggered rows that slide in one by one, words glowing like classic, with corner guide lines.
+// Partita: the line split into staggered rows that slide in one by one, words glowing like
+// classic, with corner guide lines.
 
 use std::rc::Rc;
 

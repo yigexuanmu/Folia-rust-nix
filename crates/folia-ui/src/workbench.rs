@@ -2768,7 +2768,7 @@ struct FontChoice {
     active: FontStyle,
 }
 
-/// The original `FontTiles`: "永Aa" drawn in each face, four to a line.
+/// The original `FontTiles`: the CJK glyph U+6C38 followed by "Aa", drawn in each face, four to a line.
 fn font_grid<'a>(tokens: Tokens, theme: &'a Theme, options: Vec<FontChoice>) -> Element<'a, crate::Message> {
     let mut grid = column![].spacing(12);
     for chunk in options.chunks(4) {

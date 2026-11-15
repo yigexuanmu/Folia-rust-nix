@@ -183,9 +183,9 @@ pub enum Message {
     OpenSettings,
     Settings(settings::Message),
     Sources(sources::Message),
-    /// 音源兜底的总开关。
+    /// Master switch for audio source fallback.
     UnlockEnabled(bool),
-    /// 音源兜底里某一路音源的开关。
+    /// Switch for one fallback audio source.
     UnlockToggle(folia_store::UnlockSource, bool),
     /// The developer page, its log panel and the two overlays.
     Developer(developer::Message),
@@ -375,7 +375,7 @@ pub struct Shell {
     background_upload_generation: u64,
     titlebar: chrome::Titlebar,
     player: folia_store::PlayerSettings,
-    /// 音源兜底的开关与音源表，改动时同步给 Omni。
+    /// Fallback switches and source table, mirrored to Omni when changed.
     unlock: folia_store::UnlockSettings,
     positioning: Option<positioner::Positioning>,
     login: login::Login,
@@ -407,7 +407,8 @@ impl Shell {
             .ok();
         if let Some(omni) = &omni {
             omni.restore_unlock(init.unlock.clone());
-            // 密钥库不可用时把会话封成密文放数据目录，重启还能接着用；没有 systemd-creds 就什么都存不了。
+            // Without a keyring, seal sessions into the data directory so they survive a restart;
+            // no systemd-creds means nothing can be kept.
             omni.keep_sessions_in(init.data_dir.join("session"));
             tracing::info!(backend = omni.session_backend().label(), "session storage ready");
         }
@@ -3672,7 +3673,7 @@ impl Shell {
         save(&self.store, &self.general)
     }
 
-    /// 音源兜底的开关改了：Omni 立刻按新的表取地址，文件随后写。
+    /// A fallback switch changed: Omni uses the new table immediately, the file follows.
     fn unlock_changed(&mut self) -> Task<Message> {
         if let Some(omni) = &self.omni {
             omni.set_unlock_settings(self.unlock.clone());

@@ -111,7 +111,8 @@ fn glyph_crop(pixels: &[u8]) -> image::RgbaImage {
         .to_image()
 }
 
-// The upper third of 是 is 日: its rows must retain background between the left and right ink edges.
+// The upper third of the CJK glyph U+662F is U+65E5: its rows must retain background between
+// the left and right ink edges.
 fn counter_pixels(image: &image::RgbaImage) -> usize {
     let mut gaps = 0;
     for y in 4..4 + (image.height() - 8) / 3 {

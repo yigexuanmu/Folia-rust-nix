@@ -1,4 +1,5 @@
-// 音源兜底：三路音源的匹名与签名，以及「平台放不了才去问」的接入点。
+// Audio source fallback: matching and signing for the three sources, and the point where a
+// fallback is only asked for when the platform cannot play.
 use folia_core::{AudioQuality, OnlineId, Track};
 use folia_omni::unlock::{self, Endpoints, Unlock};
 use folia_omni::{
@@ -10,8 +11,9 @@ use std::io::{Read, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-/// fork 的 kwDESEncrypt 对同样这几条查询串的输出，用来钉住移植后的那版 DES 与补零规则：
-/// 它把 S 盒与 P 置换合成了一张表、整块按小端读写，和标准 DES 的输出并不相同。
+/// Outputs of the fork's `kwDESEncrypt` for these queries, pinning the ported DES variant and its
+/// padding: it merges the S-boxes with P and reads whole blocks little-endian, so it differs from
+/// standard DES.
 #[test]
 fn kuwo_signature_matches_the_fork() {
     let cases = [
@@ -20,7 +22,7 @@ fn kuwo_signature_matches_the_fork() {
             "NI8S5evAnmHH4UXcuKKslDk4RFzONrTj1BvCoyMODMTUvpQlWnft3Eccd/NC9JdLFsVy/tvCgksRUHX6eSWQFEXV3zZS3yrqb2ASAUwCJKYLJ6ShYiU19qWNmoyxI7Y+uiPVjLRovgU=",
         ),
         ("abc", "5qlmiytFsQY="),
-        // 正好整块时补一整块零，和 fork 的 `mode === 0` 一致。
+        // An exact multiple of eight bytes gets a whole extra zero block, matching the fork's `mode === 0`.
         ("12345678", "Njw+DTAxpGxqY0iIU+Qd0Q=="),
         ("123456789", "Njw+DTAxpGwIIc44uKhZLQ=="),
     ];
@@ -33,13 +35,13 @@ fn kuwo_signature_matches_the_fork() {
 fn songs_match_by_bare_name_and_artist() {
     let cases: [(&str, Option<&str>, &str, Option<&str>, bool); 8] = [
         ("七里香", Some("周杰伦"), "七里香", Some("周杰伦"), true),
-        // 括号里的注释（现场版、影视剧名）不参与比较。
+        // Parenthetical notes (live versions, soundtrack names) do not take part in the match.
         ("七里香 (Live)", Some("周杰伦"), "七里香", Some("周杰伦"), true),
         ("七里香（电视剧《…》主题曲）", Some("周杰伦"), "七里香", Some("周杰伦"), true),
         ("七里香", Some("周杰伦"), "七里香", Some("林俊杰"), false),
-        // 歌名互相包含也算同一首：搜索结果常带上伴奏、专辑之类的后缀。
+        // Mutual containment counts as the same title: search hits often append "instrumental" or an album name.
         ("七里香 伴奏", Some("周杰伦"), "七里香", Some("周杰伦"), true),
-        // 歌手只是互相包含，不看词序：fork 也是这么比的。
+        // Artists also match by mutual containment, ignoring word order, as in the fork.
         ("因为爱情", Some("陈奕迅/王菲"), "因为爱情", Some("王菲 & 陈奕迅"), false),
         ("", Some("周杰伦"), "七里香", Some("周杰伦"), false),
         ("七里香", Some("周杰伦"), "七里香", None, true),
@@ -51,7 +53,7 @@ fn songs_match_by_bare_name_and_artist() {
             "{found:?}/{found_artist:?} against {wanted:?}/{wanted_artist:?}"
         );
     }
-    // 括号没合上时原样保留，和 fork 的正则一致。
+    // An unclosed parenthesis stays verbatim, matching the fork's regex.
     assert!(unlock::matches_song("七里香 (Live", Some("周杰伦"), "七里香", Some("周杰伦")));
 }
 
@@ -71,7 +73,7 @@ fn keywords_and_extensions_follow_the_address() {
     assert_eq!(unlock::audio_extension("https://a.test/x.MP3#t"), "mp3");
 }
 
-/// 本地服务器：按请求路径给出三路音源各自的回答，`/audio` 一律给一段音频。
+/// Local server: answers by request path for each of the three sources; `/audio/` always serves audio bytes.
 struct Server {
     base: String,
     stop: Arc<AtomicBool>,
@@ -141,7 +143,7 @@ impl Server {
     }
 }
 
-/// 酷我把搜索结果放在 `content[1].musicpage.abslist` 里（`content[0]` 是别的聚合块）。
+/// Kuwo puts search hits in `content[1].musicpage.abslist`; `content[0]` is another aggregate block.
 fn search_answer() -> String {
     r#"{"content":[{"type":"comprehensive"},{"musicpage":{"abslist":[
         {"MUSICRID":"MUSIC_1","SONGNAME":"别的歌","ARTIST":"别人"},
@@ -150,7 +152,7 @@ fn search_answer() -> String {
         .to_owned()
 }
 
-/// 只开给定的这几路音源。
+/// Enables only the given sources.
 fn settings(sources: &[(UnlockSource, bool)]) -> UnlockSettings {
     let mut settings = UnlockSettings::default();
     for key in UnlockSource::ALL {
@@ -172,7 +174,7 @@ fn locked_track(provider: &str) -> Track {
     }
 }
 
-/// 波点那一路：先在酷我搜到同一首，再要 320kbps 的地址。
+/// Bodian: match the song in Kuwo search first, then ask for the 320 kbps URL.
 #[tokio::test]
 async fn bodian_answers_with_the_matched_song() {
     let server = Server::start(vec![
@@ -186,7 +188,7 @@ async fn bodian_answers_with_the_matched_song() {
     assert_eq!(found.url, format!("{}/audio/bodian.mp3", server.base));
 }
 
-/// 酷我那一路：签名后的查询串交回一段文本，地址嵌在里面。
+/// Kuwo: the signed query returns text with the URL embedded.
 #[tokio::test]
 async fn kuwo_reads_the_address_out_of_its_answer() {
     let server = Server::start(vec![
@@ -199,7 +201,7 @@ async fn kuwo_reads_the_address_out_of_its_answer() {
     assert_eq!(found.url, format!("{}/audio/kuwo.mp3", server.base));
 }
 
-/// 聚合 API 只认网易云的歌：别的平台的 id 问过去是另一首歌，这一路直接跳过。
+/// The aggregate API indexes NetEase only: another platform's id points at a different song, so skip this source.
 #[tokio::test]
 async fn the_aggregate_api_is_only_asked_for_netease_songs() {
     let server = Server::start(vec![("/api.php", r#"{"url":"http://{base}/audio/netease.mp3"}"#.into())]);
@@ -211,7 +213,7 @@ async fn the_aggregate_api_is_only_asked_for_netease_songs() {
     assert!(unlock.source(&locked_track("qq"), &settings).await.is_none());
 }
 
-/// 关掉总开关时一个音源都不问。
+/// With the master switch off, no source is asked.
 #[tokio::test]
 async fn the_switch_stops_every_source() {
     let server = Server::start(vec![("/api.php", r#"{"url":"http://{base}/audio/x.mp3"}"#.into())]);
@@ -221,7 +223,7 @@ async fn the_switch_stops_every_source() {
     assert!(unlock.source(&locked_track("netease"), &settings).await.is_none());
 }
 
-/// 平台说这首歌放不了时，播放拿到的是备用音源给的整首。
+/// When the platform refuses the track, playback receives the full track from a fallback source.
 #[tokio::test]
 async fn a_refused_song_plays_from_the_alternate_source() {
     let server = Server::start(vec![
@@ -243,7 +245,7 @@ async fn a_refused_song_plays_from_the_alternate_source() {
     assert!(path.to_string_lossy().ends_with("-high.mp3"), "{}", path.display());
 }
 
-/// 备用音源也没有时，平台的原话照旧往外报。
+/// With no fallback URL either, the platform's own failure is reported unchanged.
 #[tokio::test]
 async fn a_refused_song_without_an_answer_keeps_the_refusal() {
     let server = Server::start(vec![]);
@@ -262,7 +264,7 @@ async fn a_refused_song_without_an_answer_keeps_the_refusal() {
     assert_eq!(calls.load(Ordering::Relaxed), 1);
 }
 
-/// 平台只肯给试听时，试听留着：备用音源问不到，播放照样能响那一段。
+/// A preview survives when no fallback answers, so playback can still start.
 #[tokio::test]
 async fn a_preview_stays_when_no_alternate_source_answers() {
     let server = Server::start(vec![]);
@@ -366,7 +368,7 @@ impl Provider for Locked {
     }
 }
 
-/// 顺序与开关由设置表决定；文件里缺了新加的音源、或留了不认识的键，都按默认表补齐。
+/// Order and switches come from the settings table; missing sources and unknown keys fall back to the defaults.
 #[test]
 fn the_settings_table_decides_the_order() {
     let mut settings = UnlockSettings::default();

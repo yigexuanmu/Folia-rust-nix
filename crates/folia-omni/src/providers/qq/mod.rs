@@ -287,7 +287,7 @@ fn tracks(list: Option<&Value>) -> Vec<Track> {
         .unwrap_or_default()
 }
 
-/// `LIKED_SONGS_DIRID`: the owned 「我喜欢」, read by its directory.
+/// `LIKED_SONGS_DIRID`: the owned "Favorites" list, read by its directory.
 const LIKED_DIR: &str = "201";
 
 /// `normalizeQqCollection` for a playlist: `tid` or `dissid`, else (and for the owned liked list) `dir-<id>`.

@@ -148,7 +148,7 @@ struct Motion {
 /// What the pages show and change; the shell owns the values.
 pub struct Values<'a> {
     pub sources: &'a crate::sources::Sources,
-    /// 音源兜底的开关与音源表。
+    /// Fallback switches and source table.
     pub unlock: &'a folia_store::UnlockSettings,
     pub language: LanguagePreference,
     pub resolved: Language,
@@ -716,7 +716,7 @@ impl Settings {
                     false,
                     kit::toggle(tokens, if on { 1.0 } else { 0.0 }, crate::Message::UnlockEnabled(!on)),
                 )];
-                // 总开关关着时，逐源的开关不显示：关着还摆一排开关只会让人以为它们在起作用。
+                // Hide per-source switches while the master switch is off, so they do not look active.
                 if on {
                     for source in folia_store::UnlockSource::ALL {
                         let enabled = values.unlock.server_enabled(source);

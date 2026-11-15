@@ -1,4 +1,4 @@
-// Still (静止): the previous, current and next lines as static text under a vignette; redrawn only when the line changes.
+// Still: the previous, current and next lines as static text under a vignette; redrawn only when the line changes.
 
 use std::cell::Cell;
 

@@ -1,4 +1,4 @@
-// Qishui (汽水音乐) over the car protocol: search, plaintext audio, KRC lyrics, Douyin QR sign-in, lists and the feed.
+// Qishui over the car protocol: search, plaintext audio, KRC lyrics, Douyin QR sign-in, lists and the feed.
 
 mod client;
 mod library;

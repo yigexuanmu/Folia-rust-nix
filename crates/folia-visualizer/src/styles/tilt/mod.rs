@@ -1,4 +1,4 @@
-// Tilt (倾诉): a line split into one to four centered rows, one of them large and italic, revealed in time order.
+// Tilt: a line split into one to four centered rows, one of them large and italic, revealed in time order.
 
 mod layout;
 mod tuning;

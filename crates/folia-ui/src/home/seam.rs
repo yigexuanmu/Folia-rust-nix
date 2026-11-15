@@ -141,7 +141,7 @@ pub(super) fn layout_of(
     }
 }
 
-/// The home seam's global search panel (`BravaisSeamSearch`): crumbs, a boxed field, the hint and 「搜索」.
+/// The home seam's global search panel (`BravaisSeamSearch`): crumbs, a boxed field, the hint and the "Search" button.
 /// It does not touch the page filter (`BravaisSeamFilterField`), which narrows the wall without a request.
 fn search_column<'a>(host: &Host<'a>, ink: Color, query: &'a str) -> Element<'a, Message> {
     let body = column![
@@ -176,7 +176,7 @@ fn search_row<'a>(host: &Host<'a>, ink: Color, query: &'a str) -> Element<'a, Me
     container(body).width(Length::Fill).height(Length::Fixed(row_layout(host))).align_y(Alignment::Center).into()
 }
 
-/// `书库 › 搜索` on the left, 「关闭搜索」 on the right.
+/// `Library > Search` on the left, "Close search" on the right.
 fn search_crumbs<'a>(host: &Host<'a>, ink: Color) -> Element<'a, Message> {
     let trail =
         format!("{} › {}", super::tr(host, "libraryBravais.homeTitle"), super::tr(host, "libraryBravaisHome.search"));
@@ -775,7 +775,7 @@ fn collection_full<'a>(host: &Host<'a>, ink: Color) -> Element<'a, Message> {
     stack![body, lifted].into()
 }
 
-/// `BravaisSeamCrumbs`: the back button and `书库 › 名字` (`› 列表` while the panel is open).
+/// `BravaisSeamCrumbs`: the back button and `Library > Name` (`> List` while the panel is open).
 fn crumbs<'a>(host: &Host<'a>, seam: &super::LayerSeam, ink: Color, panel: bool) -> Element<'a, Message> {
     let mut trail = format!("{} › {}", super::tr(host, "libraryBravais.homeTitle"), seam.title);
     if panel {
@@ -1567,7 +1567,7 @@ fn album_poster<'a>(host: &Host<'a>, seam: &super::LayerSeam, album: &super::Alb
         }
         None => space().into(),
     };
-    // `.bravais-poster-top`: back and crumbs in ink on the paper, then 「过滤当前页」; it fades in after 200ms.
+    // `.bravais-poster-top`: back and crumbs in ink on the paper, then "Filter this page"; it fades in after 200ms.
     let top_ink = fade(ink, entry.top());
     let filter_face = row![
         icon(Icon::ListFilter, 15.0, top_ink),

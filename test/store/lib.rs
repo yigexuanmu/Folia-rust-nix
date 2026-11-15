@@ -169,7 +169,7 @@ fn visualizer_tables_keep_style_keys() {
     assert_eq!(loaded, settings);
 }
 
-/// 音源兜底的自有文件：改动原样回来，缺项与多余项都按默认表补齐。
+/// The fallback settings file round-trips, and missing or unknown entries fall back to defaults.
 #[test]
 fn song_unlock_settings_round_trip_and_fill_the_default_table() {
     let dir = tempfile::tempdir().unwrap();
@@ -182,7 +182,7 @@ fn song_unlock_settings_round_trip_and_fill_the_default_table() {
     assert!(text.contains("schema_version = 1"), "{text}");
     assert_eq!(store.load::<UnlockSettings>().unwrap(), settings);
 
-    // 手改过的旧文件：只有一路音源、还有个不认识的键。
+    // A hand-edited older file: one source and an unrecognised key.
     fs::write(
         dir.path().join("unlock.toml"),
         "schema_version = 1\nenabled = false\n\n[[servers]]\nkey = \"kuwo\"\nenabled = true\n\n[[servers]]\nkey = \"qq\"\nenabled = true\n",

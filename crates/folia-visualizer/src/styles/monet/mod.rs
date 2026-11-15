@@ -1,4 +1,4 @@
-// Monet (莫奈): a poster with the lyric rail on the left and a portrait on the right.
+// Monet: a poster with the lyric rail on the left and a portrait on the right.
 
 mod ink;
 mod layout;

@@ -372,13 +372,13 @@ pub struct Omni {
     providers: Arc<Vec<Box<dyn Provider>>>,
     http: reqwest::Client,
     cache_dir: PathBuf,
-    /// 平台会话：密钥库优先，其次是 systemd-creds 封的本机密文文件。
+    /// Platform sessions: keyring first, then a file sealed by systemd-creds when it is unavailable.
     sessions: Arc<session::Store>,
     covers: Arc<tokio::sync::Semaphore>,
     cover_locks: Arc<CoverLocks>,
     sources: Arc<lx::Sources>,
     audio_cache: Arc<audio_cache::AudioCache>,
-    /// 音源兜底：VIP/版权受限时去问的第三方音源，与它的开关。
+    /// Fallback audio sources and their switches, consulted for VIP or copyright restrictions.
     unlock: Arc<unlock::Unlock>,
     unlock_settings: Arc<parking_lot::RwLock<folia_store::UnlockSettings>>,
 }
@@ -490,7 +490,7 @@ impl Omni {
         self.sources.take_alerts()
     }
 
-    /// 读入音源兜底的设置；启动时一次就够。
+    /// Reads the fallback settings once at startup.
     pub fn restore_unlock(&self, settings: folia_store::UnlockSettings) {
         *self.unlock_settings.write() = settings;
     }
@@ -499,7 +499,7 @@ impl Omni {
         self.unlock_settings.read().clone()
     }
 
-    /// 改音源兜底的设置：下一次取地址起生效；已记下的试听地址不再复用，免得改完还放试听。
+    /// Updates the fallback settings. Cached preview URLs are dropped so a change cannot leave the player on a preview.
     pub fn set_unlock_settings(&self, settings: folia_store::UnlockSettings) {
         let changed = *self.unlock_settings.read() != settings;
         *self.unlock_settings.write() = settings;
@@ -508,16 +508,19 @@ impl Omni {
         }
     }
 
-    /// 把三个第三方音源指向别的地址，测试用。
+    /// Points the three fallback sources at other endpoints, for tests.
     pub fn with_unlock_endpoints(mut self, endpoints: unlock::Endpoints) -> Self {
         self.unlock = Arc::new(unlock::Unlock::with_endpoints(self.http.clone(), endpoints));
         self
     }
 
-    /// 平台自己的地址。平台说放不了（会员、版权、下架）、或只肯给一段试听时，按设置里的顺序去问第三方
-    /// 音源：问到就给整首的地址，问不到就照平台的原样交回去（试听照放、失败照报）。
+    /// The platform's own URL. When the platform refuses the track (subscription, copyright,
+    /// delisting) or serves only a preview, ask the fallback sources in the configured order: a
+    /// full-track URL wins, otherwise the platform's answer passes through unchanged (the preview
+    /// still plays, the failure still reports).
     ///
-    /// 连不上、超时、被平台拒绝这几种不问：换一个音源也一样拿不到，只会多等几秒。
+    /// Connection errors, timeouts and rejections are not retried through a fallback: another
+    /// source cannot help there, and would only add seconds to the wait.
     pub(crate) async fn platform_audio_source(
         &self,
         provider: &dyn Provider,
@@ -539,7 +542,7 @@ impl Omni {
         Ok(AudioSource {
             extension: unlock::audio_extension(&unlocked.url),
             url: unlocked.url,
-            // 第三方音源交出来的是整首，不是试听片段。
+            // A fallback source returns the whole track, never a preview clip.
             preview: false,
             level,
         })

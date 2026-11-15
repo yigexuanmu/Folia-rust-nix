@@ -32,7 +32,7 @@ fn timed(text: &str, start: f64, end: f64, translation: Option<&str>) -> Line {
     Line { words, start, end, text: text.to_owned(), translation: translation.map(str::to_owned), ..Line::default() }
 }
 
-/// 《我好像在哪见过你》 as the platform serves it: a "title - artist" line, the intro dots, then the verse.
+/// The Chinese sample song as the platform serves it: a "title - artist" line, the intro dots, then the verse.
 fn song() -> Lyrics {
     let head = Line {
         words: vec![

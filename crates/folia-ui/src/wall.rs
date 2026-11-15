@@ -1797,7 +1797,7 @@ pub fn seam_on_axis(
     Seam { center, width, collapsed: open_width > 1.0 && width < 2.0, before: center < line, horizontal }
 }
 
-/// `(开口 / 排版宽度 − 0.35) / 0.65`, zero once the opening is under 35% of the laid-out width.
+/// `(opening / laid-out width − 0.35) / 0.65`, zero once the opening is under 35% of the laid-out width.
 pub fn content_opacity(open: f32, layout: f32) -> f32 {
     ((open / layout.max(1.0) - 0.35) / 0.65).clamp(0.0, 1.0)
 }

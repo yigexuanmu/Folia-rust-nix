@@ -494,13 +494,14 @@ fn rule<'a>(color: Color) -> Element<'a, Message> {
         .into()
 }
 
-/// `透光`: value cycled by the wall look store, which this build does not have yet; shown as its current solid state.
+/// The original's translucency control: its wall look store is absent here, so the control
+/// stays at the current solid value.
 fn look_row<'a>(face: Face<'a>) -> Element<'a, Message> {
     let value = face.i18n.t("options.libraryWallLookSolid");
     action_row(face, Icon::Blinds, face.i18n.t("options.libraryWallLook"), Some(value), None, false)
 }
 
-/// `海报聚焦叠色`: the toggle needs `latticePosterTintEnabled`, absent here, so it stays off and disabled.
+/// The original's poster tint control: it needs `latticePosterTintEnabled`, absent here, so it stays off and disabled.
 fn tint_row<'a>(face: Face<'a>) -> Element<'a, Message> {
     action_row(face, Icon::Layers, face.i18n.t("options.latticePosterTint"), None, Some(false), false)
 }
