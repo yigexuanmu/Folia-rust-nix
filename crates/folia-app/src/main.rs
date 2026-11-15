@@ -15,11 +15,14 @@ use tracing_subscriber::util::SubscriberInitExt;
 // Debug builds keep their data apart from release ones, and both stay apart from the Electron app's "Folia" folder.
 const APP_DIR: &str = if cfg!(debug_assertions) { "Folia-rust-dev" } else { "Folia-rust" };
 // wgpu-hal's Vulkan backend warns on every `VK_SUBOPTIMAL_KHR` present; on NVIDIA Wayland that is every frame,
-// which floods the runtime log with nothing the user can act on. Errors still come through.
+// which floods the runtime log with nothing the user can act on. Errors still come through. Creating a window logs
+// its whole attributes structure at INFO — `iced_winit` renders it at 21 MB because the icon's RGBA array is
+// printed as decimal numbers, and winit's span carries the same structure — so both are muted for nothing but
+// warnings.
 const DEFAULT_LOG: &str = if cfg!(debug_assertions) {
-    "debug,wgpu=warn,naga=warn,iced=info,cosmic_text=warn,wgpu_hal::vulkan=error"
+    "debug,wgpu=warn,naga=warn,iced=info,iced_winit=warn,winit=warn,cosmic_text=warn,wgpu_hal::vulkan=error"
 } else {
-    "info,wgpu_hal::vulkan=error"
+    "info,iced_winit=warn,winit=warn,wgpu_hal::vulkan=error"
 };
 
 fn window_settings() -> anyhow::Result<iced::window::Settings> {
@@ -88,6 +91,7 @@ fn init_logging(dirs: &AppDirs, developer: &DeveloperSettings) -> RuntimeLog {
 }
 
 fn main() -> anyhow::Result<()> {
+    folia_memory::tune();
     let dirs = AppDirs::new(APP_DIR)?;
     let store = Store::at(&dirs.config);
     let developer: DeveloperSettings = store.load_or_default();

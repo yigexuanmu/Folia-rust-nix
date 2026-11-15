@@ -23,6 +23,7 @@ folia-omni = { path = "crates/folia-omni" }
 folia-player = { path = "crates/folia-player" }
 folia-visualizer = { path = "crates/folia-visualizer" }
 folia-render = { path = "crates/folia-render" }
+folia-memory = { path = "crates/folia-memory" }
 
 aes = "=0.8.4"
 anyhow = "1.0.104"
@@ -43,6 +44,7 @@ iced = { version = "0.14.0", default-features = false, features = ["advanced", "
 iced_wgpu = "=0.14.0"
 iced_runtime = "0.14.0"
 keyring = "=4.2.0"
+libc = "0.2.191"
 librespot-audio = { version = "=0.8.0", default-features = false, features = ["rustls-tls-webpki-roots"] }
 librespot-core = { version = "=0.8.0", default-features = false, features = ["rustls-tls-webpki-roots"] }
 librespot-metadata = { version = "=0.8.0", default-features = false, features = ["rustls-tls-webpki-roots"] }

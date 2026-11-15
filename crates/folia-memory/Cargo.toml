@@ -1,0 +1,15 @@
+[package]
+name = "folia-memory"
+description = "Allocator tuning for the Folia desktop process"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+libc.workspace = true
+
+# The one crate that calls into the C allocator: `mallopt` and `malloc_trim` have no safe wrapper, and everything
+# here is those two calls.
+[lints.rust]
+unsafe_code = "allow"

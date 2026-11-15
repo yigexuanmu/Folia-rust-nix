@@ -61,9 +61,12 @@ pub struct RuntimeLog {
 impl RuntimeLog {
     /// Records tracing fields, including every cause of structured error fields.
     pub fn record_event(&self, event: &tracing::Event<'_>) {
+        if !self.capture() {
+            return;
+        }
         let mut text = EventText::default();
         event.record(&mut text);
-        self.push(*event.metadata().level(), event.metadata().target(), &text.0);
+        self.push_clipped(*event.metadata().level(), event.metadata().target(), Cow::Owned(text.into_message()));
     }
 
     pub fn new(path: PathBuf) -> Self {
@@ -104,11 +107,15 @@ impl RuntimeLog {
 
     /// Records one event; called from the tracing layer on whichever thread logged it.
     pub fn push(&self, level: Level, target: &str, message: &str) {
+        self.push_clipped(level, target, clipped(message));
+    }
+
+    /// Records a message that is already within [`MAX_MESSAGE_BYTES`].
+    fn push_clipped(&self, level: Level, target: &str, message: Cow<'_, str>) {
         if !self.inner.capture.load(Ordering::Relaxed) {
             return;
         }
         let at = SystemTime::now();
-        let message = clipped(message);
         if self.inner.file_on.load(Ordering::Relaxed) {
             self.inner.file.write(&file_line(at, level, target, &message));
         }
@@ -195,8 +202,11 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 }
 
 /// Renders one tracing event into the text the session log panel shows and the file keeps.
+///
+/// The text is bounded as it is rendered: a dependency that logs a whole window's attributes must not allocate
+/// tens of megabytes first and then have all but the first few kilobytes cut off.
 #[derive(Default)]
-struct EventText(String);
+struct EventText(Capped);
 
 impl Visit for EventText {
     fn record_error(&mut self, field: &Field, value: &(dyn std::error::Error + 'static)) {
@@ -220,6 +230,45 @@ impl EventText {
         } else {
             let _ = write!(self.0, " {}={value}", field.name());
         }
+    }
+
+    fn into_message(self) -> String {
+        self.0.into_message()
+    }
+}
+
+/// A string sink that keeps at most [`MAX_MESSAGE_BYTES`] and counts the rest instead of storing it.
+#[derive(Default)]
+struct Capped {
+    text: String,
+    dropped: usize,
+}
+
+impl std::fmt::Write for Capped {
+    fn write_str(&mut self, piece: &str) -> std::fmt::Result {
+        let room = MAX_MESSAGE_BYTES - self.text.len();
+        if piece.len() <= room {
+            self.text.push_str(piece);
+            return Ok(());
+        }
+        let mut end = room;
+        while !piece.is_char_boundary(end) {
+            end -= 1;
+        }
+        self.text.push_str(&piece[..end]);
+        self.dropped += piece.len() - end;
+        Ok(())
+    }
+}
+
+impl Capped {
+    /// The text with the same note of what was dropped as [`clipped`] adds.
+    fn into_message(mut self) -> String {
+        if self.dropped > 0 {
+            use std::fmt::Write as _;
+            let _ = write!(self.text, " … ({} bytes cut)", self.dropped);
+        }
+        self.text
     }
 }
 
@@ -251,5 +300,17 @@ mod tests {
         let cut = clipped(&message);
         assert!(cut.ends_with("… (8193 bytes cut)"));
         assert_eq!(cut.chars().filter(|c| *c == '日').count(), (MAX_MESSAGE_BYTES - 1) / 3);
+    }
+
+    /// Rendering stops at the cap instead of building the whole 21 MB line first.
+    #[test]
+    fn a_huge_field_never_grows_the_text_past_the_cap() {
+        use std::fmt::Write as _;
+        let mut text = Capped::default();
+        let _ = write!(text, "{}", "日".repeat(MAX_MESSAGE_BYTES));
+        let message = text.into_message();
+        assert!(message.starts_with('日'));
+        assert!(message.ends_with("bytes cut)"));
+        assert!(message.len() < MAX_MESSAGE_BYTES + 32);
     }
 }
