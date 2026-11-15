@@ -1,5 +1,6 @@
 // The session log kept in memory for the developer page, and the same lines written to a file when asked.
 
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -13,6 +14,14 @@ use tracing::field::{Field, Visit};
 use crate::developer::LogMode;
 use crate::file_log::FileLog;
 use crate::log_file::{LOG_ENTRIES, LOG_LINES};
+
+/// Bytes of one message kept in the session log and the log file.
+///
+/// Dependencies can log a whole data structure at INFO. `iced_winit` prints every window's attributes, including
+/// the icon's RGBA array as decimal numbers: with a 512×512 icon that is a single 21 MB line. The panel shapes the
+/// text of each line it shows, and shaping tens of megabytes in one layout stalls the interface for minutes, so
+/// lines are cut here, once, for both destinations.
+const MAX_MESSAGE_BYTES: usize = 4096;
 
 /// One recorded line: the tracing level, the module target it came from, and its rendered text.
 #[derive(Debug, Clone)]
@@ -99,15 +108,16 @@ impl RuntimeLog {
             return;
         }
         let at = SystemTime::now();
+        let message = clipped(message);
         if self.inner.file_on.load(Ordering::Relaxed) {
-            self.inner.file.write(&file_line(at, level, target, message));
+            self.inner.file.write(&file_line(at, level, target, &message));
         }
         let id = self.inner.next.fetch_add(1, Ordering::Relaxed);
         let mut lines = self.inner.lines.lock();
         if lines.len() >= LOG_ENTRIES {
             lines.pop_front();
         }
-        lines.push_back(LogLine { id, at, level, target: target.to_owned(), message: message.to_owned() });
+        lines.push_back(LogLine { id, at, level, target: target.to_owned(), message: message.into_owned() });
     }
 
     pub fn entries(&self) -> Vec<LogLine> {
@@ -132,6 +142,19 @@ impl RuntimeLog {
 
 fn file_line(at: SystemTime, level: Level, target: &str, message: &str) -> String {
     format!("{} [{}] [{}] {}", iso(at), level.as_str(), target, message)
+}
+
+/// `message` cut to [`MAX_MESSAGE_BYTES`] on a character boundary, with a note of what was dropped.
+fn clipped(message: &str) -> Cow<'_, str> {
+    if message.len() <= MAX_MESSAGE_BYTES {
+        return Cow::Borrowed(message);
+    }
+    let mut end = MAX_MESSAGE_BYTES;
+    while !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    let dropped = message.len() - end;
+    Cow::Owned(format!("{} … ({dropped} bytes cut)", &message[..end]))
 }
 
 /// `YYYY-MM-DDTHH:MM:SSZ`, UTC because the standard library has no local calendar.
@@ -210,4 +233,23 @@ pub fn error_chain(err: &dyn std::error::Error) -> String {
         source = cause.source();
     }
     text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_short_message_is_kept_as_it_is() {
+        assert!(matches!(clipped("started"), Cow::Borrowed("started")));
+    }
+
+    /// The 21 MB `WindowAttributes` line is cut where a character ends, and says how much is missing.
+    #[test]
+    fn a_long_message_is_cut_on_a_character_boundary() {
+        let message = "日".repeat(MAX_MESSAGE_BYTES);
+        let cut = clipped(&message);
+        assert!(cut.ends_with("… (8193 bytes cut)"));
+        assert_eq!(cut.chars().filter(|c| *c == '日').count(), (MAX_MESSAGE_BYTES - 1) / 3);
+    }
 }

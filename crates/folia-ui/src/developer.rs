@@ -22,6 +22,10 @@ const OVERLAY_LOG_HEIGHT: f32 = 416.0;
 /// rows are enough there. The Alt+Shift+D overlay is opened on purpose and can show the full tail.
 const INLINE_LOG_ROWS: usize = 60;
 const OVERLAY_LOG_ROWS: usize = 400;
+/// Characters of a log line the panel draws. Lines are stored longer, but one noisy entry (a whole window's
+/// attributes, a whole response body) must not make a single layout shape megabytes of text. The copy still gets
+/// the whole stored line.
+const ROW_PREVIEW_CHARS: usize = 512;
 const CHART_HEIGHT: f32 = 120.0;
 /// `DraggableDebugWindow`: `top-4 right-4`, and at least this much stays on screen.
 const ANCHOR: f32 = 16.0;
@@ -398,10 +402,7 @@ pub fn log_panel<'a>(
         }
         shown += 1;
         let color = level_color(line.level, tokens);
-        let content = crate::typeface::LOG_ROW
-            .text(format!("{} [{}] {}", clock(line.at), line.target, line.message))
-            .color(color)
-            .width(Length::Fill);
+        let content = crate::typeface::LOG_ROW.text(row_text(line)).color(color).width(Length::Fill);
         list = list.push(container(content).width(Length::Fill).padding(Padding {
             top: 2.0,
             right: 8.0,
@@ -424,6 +425,17 @@ pub fn log_panel<'a>(
         .width(Length::Fill)
         .style(move |_| kit::rounded(tokens.pv, 8.0))
         .into()
+}
+
+/// One row's text: `HH:MM:SS [target] message`, cut to [`ROW_PREVIEW_CHARS`] characters with an ellipsis.
+fn row_text(line: &LogLine) -> String {
+    let full = line.text();
+    let mut chars = full.chars();
+    let shown: String = chars.by_ref().take(ROW_PREVIEW_CHARS).collect();
+    if chars.next().is_none() {
+        return shown;
+    }
+    format!("{shown}…")
 }
 
 fn pill<'a>(tokens: Tokens, label: String, active: bool, on_press: crate::Message) -> Element<'a, crate::Message> {
@@ -759,5 +771,23 @@ mod tests {
         log.clear();
         developer.refresh_log(&log);
         assert_eq!(developer.log_revision, log.revision());
+    }
+
+    /// The panel shapes every drawn row; one enormous entry must become a short preview instead.
+    #[test]
+    fn an_enormous_line_is_drawn_as_a_preview() {
+        let line = LogLine {
+            id: 1,
+            at: std::time::SystemTime::now(),
+            level: Level::INFO,
+            target: "log".to_owned(),
+            message: "x".repeat(4096),
+        };
+        let drawn = row_text(&line);
+        assert_eq!(drawn.chars().count(), ROW_PREVIEW_CHARS + 1);
+        assert!(drawn.ends_with('…'));
+
+        let short = LogLine { message: "started".to_owned(), ..line };
+        assert_eq!(row_text(&short), short.text());
     }
 }
