@@ -7,6 +7,9 @@ use iced::{Alignment, Background, Border, Color, Element, Font, Length, Padding,
 
 use crate::icons::icon;
 
+#[path = "select_popup.rs"]
+mod select_popup;
+
 const ON_ACCENT_DARK: Rgb = Rgb::hex(0x17171a);
 const ON_ACCENT_LIGHT: Rgb = Rgb::hex(0xffffff);
 pub const SEMIBOLD: Font = crate::typeface::SEMIBOLD;
@@ -270,13 +273,23 @@ pub struct Group<'a, M> {
 }
 
 pub fn group<'a, M: 'a>(tokens: Tokens, group: Group<'a, M>, first: bool) -> Element<'a, M> {
-    group_with_rows(tokens, group, first, |rows| column(rows).into())
+    group_with_rows(tokens, group, first, 0.0, |rows| column(rows).into())
+}
+
+pub(crate) fn landed_group<'a, M: 'a>(
+    tokens: Tokens,
+    group: Group<'a, M>,
+    first: bool,
+    highlight: f32,
+) -> Element<'a, M> {
+    group_with_rows(tokens, group, first, highlight, |rows| column(rows).into())
 }
 
 pub(crate) fn group_with_rows<'a, M: 'a>(
     tokens: Tokens,
     group: Group<'a, M>,
     first: bool,
+    highlight: f32,
     list: impl FnOnce(Vec<Element<'a, M>>) -> Element<'a, M>,
 ) -> Element<'a, M> {
     let Group { title, bare, rows, foot } = group;
@@ -285,13 +298,19 @@ pub(crate) fn group_with_rows<'a, M: 'a>(
         let mut row = column![];
         if index > 0 {
             let inset = if entry.sub { 40.0 } else { 16.0 };
-            row = row.push(container(fill_box(tokens.line).height(1)).padding(Padding::ZERO.left(inset)));
+            row = row.push(
+                container(fill_box(tokens.line).width(Length::Fill).height(1)).padding(Padding::ZERO.left(inset)),
+            );
         }
         entries.push(row.push(row_view(tokens, entry)).into());
     }
     let card = container(list(entries)).width(Length::Fill).style(move |_| container::Style {
         background: Some(tokens.card.into()),
-        border: Border { color: tokens.line, width: 1.0, radius: 12.0.into() },
+        border: Border {
+            color: mix(tokens.line, tokens.accent, highlight),
+            width: 1.0 + highlight,
+            radius: 12.0.into(),
+        },
         ..container::Style::default()
     });
     let mut body = column![space().height(if first { FIRST_GROUP_GAP } else { GROUP_GAP })];
@@ -309,6 +328,13 @@ pub(crate) fn group_with_rows<'a, M: 'a>(
 }
 
 fn row_view<'a, M: 'a>(tokens: Tokens, entry: Row<'a, M>) -> Element<'a, M> {
+    if entry.label.is_empty() && entry.hint.is_none() {
+        let controls = column![entry.control].extend(entry.below);
+        return container(row![space().height(36), controls].align_y(Alignment::Center))
+            .padding([10, 16])
+            .width(Length::Fill)
+            .into();
+    }
     let mut label = column![crate::typeface::LABEL.text(entry.label).color(tokens.t1)];
     if let Some(hint) = entry.hint {
         label = label.push(space().height(2)).push(crate::typeface::HINT.text(hint).color(tokens.t2));
@@ -395,7 +421,17 @@ pub fn segmented<'a, T: Copy + PartialEq + 'a, M: Clone + 'a>(
     mark: Option<f32>,
     on_change: impl Fn(T) -> M,
 ) -> Element<'a, M> {
-    segmented_choices(tokens, options, value, mark, true, on_change)
+    segmented_choices(tokens, options, value, mark, true, &[], on_change)
+}
+
+pub fn segmented_available<'a, T: Copy + PartialEq + 'a, M: Clone + 'a>(
+    tokens: Tokens,
+    options: Vec<(T, String)>,
+    value: T,
+    unavailable: &[T],
+    on_change: impl Fn(T) -> M,
+) -> Element<'a, M> {
+    segmented_choices(tokens, options, value, None, true, unavailable, on_change)
 }
 
 /// The same strip, dimmed and not clickable when `enabled` is false (a mode with its file switched off).
@@ -407,7 +443,7 @@ pub fn segmented_enabled<'a, T: Copy + PartialEq + 'a, M: Clone + 'a>(
     enabled: bool,
     on_change: impl Fn(T) -> M,
 ) -> Element<'a, M> {
-    segmented_choices(tokens, options, value, mark, enabled, on_change)
+    segmented_choices(tokens, options, value, mark, enabled, &[], on_change)
 }
 
 fn segmented_choices<'a, T: Copy + PartialEq + 'a, M: Clone + 'a>(
@@ -416,10 +452,12 @@ fn segmented_choices<'a, T: Copy + PartialEq + 'a, M: Clone + 'a>(
     value: T,
     mark: Option<f32>,
     enabled: bool,
+    unavailable: &[T],
     on_change: impl Fn(T) -> M,
 ) -> Element<'a, M> {
     let widths: Vec<f32> = options.iter().map(|(_, label)| label_width(label, 13.0) + 24.0).collect();
     let total: f32 = widths.iter().sum();
+    let mark = mark.or_else(|| options.iter().position(|(option, _)| *option == value).map(|index| index as f32));
     let ground = fill_box(tokens.fill).width(total + 4.0).height(32).style(move |_| rounded(tokens.fill, 8.0));
     let mut layers = stack![ground];
     if let Some(mark) = mark {
@@ -438,6 +476,7 @@ fn segmented_choices<'a, T: Copy + PartialEq + 'a, M: Clone + 'a>(
     }
     let mut choices = row![].padding(2);
     for ((option, label), width) in options.into_iter().zip(widths) {
+        let enabled = enabled && !unavailable.contains(&option);
         let selected = option == value;
         let ink = if selected { tokens.t1 } else { tokens.t2 };
         let ink = if enabled { ink } else { Color { a: ink.a * 0.4, ..ink } };
@@ -460,7 +499,9 @@ pub fn select<'a, T: Clone + PartialEq + 'a, M: Clone + 'a>(
 ) -> Element<'a, M> {
     let widest = options.iter().map(|choice| label_width(&choice.label, 13.0)).fold(0.0, f32::max);
     let width = (widest + 12.0 + 8.0 + 8.0 + 16.0).clamp(136.0, 240.0);
-    pick_list(options, Some(value), on_change)
+    let opacity = std::rc::Rc::new(std::cell::Cell::new(1.0));
+    let menu_opacity = opacity.clone();
+    let select = pick_list(options, Some(value), on_change)
         .font(crate::typeface::adapt(crate::typeface::SYSTEM))
         .width(width)
         .padding(Padding { top: 7.0, right: 8.0, bottom: 7.0, left: 12.0 })
@@ -474,19 +515,22 @@ pub fn select<'a, T: Clone + PartialEq + 'a, M: Clone + 'a>(
             background: if status == pick_list::Status::Active { tokens.fill } else { tokens.fill2 }.into(),
             border: Border { radius: 8.0.into(), ..Border::default() },
         })
-        .menu_style(move |_| iced::overlay::menu::Style {
-            background: tokens.menu.into(),
-            border: Border { color: tokens.line2, width: 1.0, radius: 10.0.into() },
-            text_color: tokens.t1,
-            selected_text_color: tokens.t1,
-            selected_background: tokens.hover.into(),
-            shadow: Shadow {
-                color: Color { a: 0.36 * tokens.shadow.a, ..Color::BLACK },
-                offset: Vector::new(0.0, 14.0),
-                blur_radius: 36.0,
-            },
-        })
-        .into()
+        .menu_style(move |_| {
+            let tokens = tokens.faded(menu_opacity.get());
+            iced::overlay::menu::Style {
+                background: tokens.menu.into(),
+                border: Border { color: tokens.line2, width: 1.0, radius: 10.0.into() },
+                text_color: tokens.t1,
+                selected_text_color: tokens.t1,
+                selected_background: tokens.hover.into(),
+                shadow: Shadow {
+                    color: Color { a: 0.36 * tokens.shadow.a, ..Color::BLACK },
+                    offset: Vector::new(0.0, 14.0),
+                    blur_radius: 36.0,
+                },
+            }
+        });
+    select_popup::view(select.into(), opacity)
 }
 
 /// Text tabs over a hairline; the accent line under the chosen one sits at `mark`, a fractional index while it slides.
@@ -592,6 +636,57 @@ pub fn rounded_button(color: Color, radius: f32) -> button::Style {
         background: Some(Background::Color(color)),
         border: Border { radius: radius.into(), ..Border::default() },
         ..button::Style::default()
+    }
+}
+
+/// The shared sheet's 32px action with theme-aware fill, contrast and hover feedback.
+pub(crate) fn sheet_button<'a, M: Clone + 'a>(
+    tokens: Tokens,
+    label: &'a str,
+    primary: bool,
+    on_press: Option<M>,
+) -> Element<'a, M> {
+    let enabled = on_press.is_some();
+    let text_color = if primary { tokens.on_accent } else { tokens.t1 };
+    let ink = if enabled { text_color } else { Color { a: text_color.a * 0.4, ..text_color } };
+    button(container(text(label).size(crate::typeface::size::CONTROL).color(ink)).center_y(32))
+        .height(32)
+        .padding([0, 12])
+        .on_press_maybe(on_press)
+        .style(move |_, status| {
+            let hot = enabled && matches!(status, button::Status::Hovered | button::Status::Pressed);
+            let fill = if primary {
+                Color { a: tokens.accent.a * if hot { 0.9 } else { 1.0 }, ..tokens.accent }
+            } else if hot {
+                tokens.fill2
+            } else {
+                tokens.fill
+            };
+            let fill = if enabled { fill } else { Color { a: fill.a * 0.4, ..fill } };
+            rounded_button(fill, 8.0)
+        })
+        .into()
+}
+
+pub fn input_style(tokens: Tokens) -> iced::widget::text_input::Style {
+    iced::widget::text_input::Style {
+        background: tokens.fill.into(),
+        border: Border { color: tokens.line2, width: 1.0, radius: 8.0.into() },
+        icon: tokens.t3,
+        placeholder: tokens.t3,
+        value: tokens.t1,
+        selection: tokens.fill2,
+    }
+}
+
+pub fn editor_style(tokens: Tokens) -> iced::widget::text_editor::Style {
+    let input = input_style(tokens);
+    iced::widget::text_editor::Style {
+        background: input.background,
+        border: input.border,
+        placeholder: input.placeholder,
+        value: input.value,
+        selection: input.selection,
     }
 }
 

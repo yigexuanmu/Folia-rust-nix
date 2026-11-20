@@ -1,6 +1,6 @@
 // Synthetic LX protocol tests; all HTTP traffic stays on a local std TCP listener.
 
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -157,12 +157,85 @@ async fn http_method_headers_body_form_and_form_data_round_trip() {
     }
 }
 
+#[tokio::test]
+async fn listening_gate_does_not_retry_failures_or_send_short_listens() {
+    let temp = tempfile::tempdir().unwrap();
+    for outcome in ["ok", "failed", "signed-out"] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let omni = Omni::with_providers(
+            temp.path().into(),
+            "folia-report-test".into(),
+            vec![Box::new(Native { calls: calls.clone(), url: outcome.into() })],
+        )
+        .unwrap();
+        let track =
+            Track { online: Some(OnlineId { provider: "fixture".into(), id: "1".into() }), ..Default::default() };
+        let mut report =
+            folia_omni::PlaybackReport { played_seconds: 29.0, total_seconds: 180.0, quality: AudioQuality::High };
+        assert!(omni.report_playback(&track, report).await.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        report.played_seconds = 40.0;
+        let first = omni.report_playback(&track, report).await;
+        assert_eq!(first.is_ok(), outcome == "ok");
+        let again = omni.clone().report_playback(&track, report).await;
+        if outcome == "signed-out" {
+            assert!(matches!(again, Err(OmniError::SignedOut)));
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+        } else {
+            assert!(matches!(again, Err(OmniError::ReportThrottled)));
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        }
+    }
+}
+
+#[tokio::test]
+async fn cancelled_listening_report_releases_the_inflight_slot() {
+    let temp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let omni = Omni::with_providers(
+        temp.path().into(),
+        "folia-report-test".into(),
+        vec![Box::new(Native { calls: calls.clone(), url: "pending".into() })],
+    )
+    .unwrap();
+    let track = Track { online: Some(OnlineId { provider: "fixture".into(), id: "1".into() }), ..Default::default() };
+    let report = folia_omni::PlaybackReport { played_seconds: 40.0, total_seconds: 180.0, quality: AudioQuality::High };
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(10), omni.report_playback(&track, report)).await.is_err()
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(5010)).await;
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(10), omni.report_playback(&track, report)).await.is_err()
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
 struct Native {
     calls: Arc<AtomicUsize>,
     url: String,
 }
 
 impl Provider for Native {
+    fn playback_reporting_ready(&self) -> bool {
+        self.url != "signed-out"
+    }
+    fn can_report_playback(&self, track: &Track) -> bool {
+        track.online.as_ref().is_some_and(|song| song.provider == "fixture")
+    }
+    fn report_playback<'a>(
+        &'a self,
+        _: &'a Track,
+        _: folia_omni::PlaybackReport,
+    ) -> BoxFuture<'a, Result<(), OmniError>> {
+        Box::pin(async {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match self.url.as_str() {
+                "pending" => std::future::pending().await,
+                "failed" => Err(OmniError::Unavailable),
+                _ => Ok(()),
+            }
+        })
+    }
     fn login_code(&self) -> BoxFuture<'_, Result<folia_omni::LoginCode, OmniError>> {
         unsupported()
     }
@@ -239,13 +312,26 @@ async fn concurrent_tiles_share_one_cover_download() {
     listener.set_nonblocking(true).unwrap();
     let received = Arc::new(AtomicUsize::new(0));
     let count = received.clone();
+    let (shutdown, stopped) = std::sync::mpsc::channel::<()>();
     let server = std::thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while Instant::now() < deadline {
+        while matches!(stopped.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)) {
             match listener.accept() {
                 Ok((mut socket, _)) => {
-                    let mut request = [0u8; 2048];
-                    socket.read(&mut request).unwrap();
+                    socket.set_nonblocking(false).unwrap();
+                    socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                    socket.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+                    let mut reader = std::io::BufReader::new(&mut socket);
+                    let mut request = String::new();
+                    loop {
+                        let read = reader.read_line(&mut request).unwrap();
+                        if read == 0 || request.ends_with("\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    if !request.ends_with("\r\n\r\n") {
+                        continue;
+                    }
+                    assert!(request.starts_with("GET /cover?px=512 HTTP/1.1\r\n"), "{request}");
                     count.fetch_add(1, Ordering::Relaxed);
                     std::thread::sleep(Duration::from_millis(80));
                     socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nRGBA").unwrap();
@@ -264,16 +350,21 @@ async fn concurrent_tiles_share_one_cover_download() {
         vec![Box::new(Native { calls: Arc::new(AtomicUsize::new(0)), url })],
     )
     .unwrap();
-    let (a, b, c) = tokio::join!(
-        omni.fetch_cover("https://cover.fixture/same", 512),
-        omni.fetch_cover("https://cover.fixture/same", 512),
-        omni.fetch_cover("https://cover.fixture/same", 512)
-    );
+    let responses = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(
+            omni.fetch_cover("https://cover.fixture/same", 512),
+            omni.fetch_cover("https://cover.fixture/same", 512),
+            omni.fetch_cover("https://cover.fixture/same", 512)
+        )
+    })
+    .await;
+    drop(shutdown);
+    server.join().unwrap();
+    let (a, b, c) = responses.expect("concurrent cover downloads did not finish");
     let a = a.unwrap();
     assert_eq!(a, b.unwrap());
     assert_eq!(a, c.unwrap());
     assert_eq!(std::fs::read(a).unwrap(), b"RGBA");
-    server.join().unwrap();
     assert_eq!(received.load(Ordering::Relaxed), 1, "identical cover URLs downloaded more than once");
 }
 
@@ -295,6 +386,86 @@ async fn thumbnail_request_reuses_a_cached_larger_cover() {
 
 fn unsupported<T>() -> BoxFuture<'static, Result<T, OmniError>> {
     Box::pin(async { Err(OmniError::Unsupported("fixture")) })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cache_move_stops_detached_downloads_and_updates_all_clones() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    let target = temp.path().join("target");
+    std::fs::create_dir_all(source.join("audio")).unwrap();
+    std::fs::write(source.join("audio/fixture-2-high.mp3"), b"ready after move").unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/audio", listener.local_addr().unwrap());
+    let (stop, stopped) = std::sync::mpsc::channel::<()>();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut request = std::io::BufReader::new(&mut stream);
+        loop {
+            let mut line = String::new();
+            request.read_line(&mut line).unwrap();
+            if line == "\r\n" {
+                break;
+            }
+        }
+        write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\nConnection: close\r\n\r\n").unwrap();
+        stream.write_all(&vec![5; 65536]).unwrap();
+        let _ = stopped.recv_timeout(Duration::from_secs(5));
+    });
+    let calls = Arc::new(AtomicUsize::new(0));
+    let omni =
+        Omni::with_providers(source.clone(), "unused".into(), vec![Box::new(Native { calls: calls.clone(), url })])
+            .unwrap();
+    let other = omni.clone();
+    let track = Track { online: Some(OnlineId { provider: "fixture".into(), id: "1".into() }), ..Default::default() };
+    let input = tokio::time::timeout(Duration::from_secs(3), omni.prepare_track_audio(&track, AudioQuality::High))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(input.download.as_ref().unwrap().progress().0 >= 65536);
+    let switch = tokio::time::timeout(Duration::from_secs(2), omni.suspend_cache()).await.unwrap();
+    assert!(input.download.as_ref().unwrap().progress().2.is_some());
+    let store = Store::at(temp.path().join("config"));
+    let moved =
+        folia_store::StorageSettings::migrate(&store, &source, Some(target.clone()), &source, |_, _| {}).unwrap();
+    let root = moved.settings.cache_path(&source).to_path_buf();
+    switch.resume(root.clone());
+    assert_eq!(other.cache_path(), root);
+    let cached = Track { online: Some(OnlineId { provider: "fixture".into(), id: "2".into() }), ..Default::default() };
+    let file = other.fetch_track_audio(&cached, AudioQuality::High).await.unwrap();
+    assert!(file.starts_with(&root));
+    assert_eq!(std::fs::read(file).unwrap(), b"ready after move");
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    stop.send(()).unwrap();
+    server.join().unwrap();
+}
+
+#[tokio::test]
+async fn cache_move_waits_for_cover_decoding_and_cancelled_fences_resume_readers() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    let target = temp.path().join("target");
+    let address = "https://example.invalid/cached.png";
+    let filename = folia_omni::cover_cache_key(address);
+    std::fs::create_dir_all(source.join("covers")).unwrap();
+    std::fs::write(source.join("covers").join(&filename), b"cover").unwrap();
+    let omni = Omni::with_providers(source.clone(), "unused".into(), vec![]).unwrap();
+    let held = omni.fetch_cover(address, 512).await.unwrap();
+    assert!(tokio::time::timeout(Duration::from_millis(20), omni.suspend_cache()).await.is_err());
+    let next = tokio::time::timeout(Duration::from_secs(1), omni.fetch_cover(address, 512)).await.unwrap().unwrap();
+    assert_eq!(std::fs::read(&next).unwrap(), b"cover");
+    drop((held, next));
+    let switch = tokio::time::timeout(Duration::from_secs(1), omni.suspend_cache()).await.unwrap();
+    let store = Store::at(temp.path().join("config"));
+    let moved =
+        folia_store::StorageSettings::migrate(&store, &source, Some(target.clone()), &source, |_, _| {}).unwrap();
+    let root = moved.settings.cache_path(&source).to_path_buf();
+    switch.resume(root.clone());
+    let cover = omni.fetch_cover(address, 512).await.unwrap();
+    assert!(cover.starts_with(root));
+    assert_eq!(std::fs::read(cover).unwrap(), b"cover");
+    assert!(!source.join("covers").join(filename).exists());
 }
 
 #[tokio::test]

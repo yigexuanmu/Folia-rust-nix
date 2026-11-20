@@ -1,12 +1,15 @@
 // Top-level UI: pages, navigation and the iced update/view/subscription functions that drive them.
 
+mod ai_settings;
 mod album_wall;
 mod background;
 mod background_image;
 mod block_reflows;
+pub mod catalog;
 mod chrome;
 mod color_picker;
 mod cover_flight;
+mod credits;
 mod design_size;
 pub mod developer;
 mod drag_capture;
@@ -14,12 +17,18 @@ mod equalizer_dialog;
 mod float_layer;
 mod focus_card;
 mod fonts;
+pub mod graphics;
+mod harmony;
 mod home;
 mod icons;
+mod lattice;
+mod lattice_controls;
 mod library;
 mod login;
 mod lots;
 mod measured;
+#[cfg(target_os = "linux")]
+mod media_session;
 mod mode_picker;
 mod motion;
 mod now_playing;
@@ -33,28 +42,42 @@ mod platform_icon;
 mod platform_rows;
 mod playback;
 mod playback_navigation;
+mod playback_session;
 mod player_bar;
 mod playlist_dialog;
 mod positioner;
 mod poster;
 mod poster_motion;
+mod preview_art;
 mod preview_stage;
 mod quality_select;
 mod queue_island;
+pub mod radio;
+mod radio_art;
+mod radio_backdrop;
 mod reorder;
+mod scene_settings;
+mod scene_sound;
 mod scrollbar;
 mod search;
 pub mod search_results;
 mod settings;
 mod settings_kit;
+pub mod smart_beat;
 mod smooth_scroll;
+pub mod song_theme;
 mod sources;
 mod splash;
+mod storage;
+pub use storage::Message as StorageMessage;
 mod status_toast;
 mod subtitle_text;
+pub mod theme_park;
 mod timeline;
 mod typeface;
 mod wall;
+mod wall_canvas;
+mod wall_hover;
 mod wall_pan;
 mod wall_shift;
 mod workbench;
@@ -66,7 +89,9 @@ pub use equalizer_dialog::{Look as EqualizerLook, view as equalizer_view};
 pub use focus_card::{Direction as CardDirection, Key as CardKey};
 pub use home::title::seam_title_activates;
 pub use home::{HELP_LIST, HelpRow, WallKey, default_level_is_spine, seam_safe_bottom, wall_key_of};
-pub use home::{HomeChrome, Host as HomeHost, overlay as home_overlay};
+pub use home::{HomeChrome, Host as HomeHost, Message as HomeMessage, overlay as home_overlay};
+pub use lattice::{Lattice, Message as LatticeMessage};
+pub use library::Message as LibraryMessage;
 pub use login::{Login, Look as LoginLook, Message as LoginMessage};
 pub use online::Message as OnlineMessage;
 pub use online::{AccountState, Online};
@@ -88,7 +113,11 @@ pub use playback_navigation::PlaybackNavigation;
 pub use player_bar::{CapsuleBox, Look as PlayerBarLook, PlayerBar, capsule_box};
 pub use playlist_dialog::{Dialog as PlaylistDialog, Look as PlaylistLook, Message as PlaylistMessage, PlaylistChoice};
 pub use reorder::drag_to_reorder;
-pub use search::{Message as SearchMessage, SearchPage, View as SearchView};
+pub use scene_settings::{
+    Look as SceneSettingsLook, Message as SceneSettingsMessage, State as SceneSettingsWindow, Tab as SceneSettingsTab,
+};
+pub use scene_sound::Message as SceneSoundMessage;
+pub use search::{Kind as SearchKind, Message as SearchMessage, SearchPage, View as SearchView};
 pub use search_results::format_duration;
 pub use settings::{Message as SettingsMessage, Section as SettingsSection, Settings, Values as SettingsValues};
 pub use settings_kit::{Faded, Tokens, panel_glass, quick_tile_fill, tools_glass};
@@ -108,8 +137,8 @@ pub use wall::{SEAM_ANCHOR, Seam, content_opacity, plan_opening, seam_geometry, 
 pub use wall_pan::{Glide as WallGlide, Inertia as WallInertia, Release as WallRelease};
 pub use wall_shift::{Kind as ShiftKind, Pose as ShiftPose, Shift as WallShift};
 pub use workbench::{
-    Effect as WorkbenchEffect, Hotspot, Look as WorkbenchLook, Message as WorkbenchMessage, Tab as WorkbenchTab,
-    Workbench, hotspot_at, scheduled_saves,
+    Effect as WorkbenchEffect, Hotspot, Live as WorkbenchLive, Look as WorkbenchLook, Message as WorkbenchMessage,
+    Sample as WorkbenchSample, Source as WorkbenchSource, Tab as WorkbenchTab, Workbench, hotspot_at, scheduled_saves,
 };
 
 use std::path::PathBuf;
@@ -138,9 +167,14 @@ const STANDARD_ONLY: &[AudioQuality] = &[AudioQuality::Standard];
 /// Everything the app reads before the window opens.
 #[derive(Clone)]
 pub struct Init {
+    pub storage: folia_store::StorageSettings,
     pub store: Store,
     pub general: GeneralSettings,
     pub appearance: AppearanceSettings,
+    pub graphics: folia_store::GraphicsSettings,
+    pub scene: folia_store::SceneSettings,
+    pub system_reduced_motion: bool,
+    pub analysis_models: PathBuf,
     pub theme: folia_store::ThemeSettings,
     pub audio: folia_store::AudioSettings,
     pub playback: PlaybackSettings,
@@ -170,34 +204,62 @@ type SeamBefore = (folia_store::HomeTab, Option<home::LayerSeam>, Option<String>
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Page {
     Library,
+    Lattice,
     Search,
     NowPlaying,
+    Catalog,
+}
+
+enum NavigationEntry {
+    Page(Page),
+    Search(Box<SearchPage>),
+    Catalog(Box<catalog::CatalogPage>),
 }
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    Storage(storage::Message),
+    #[cfg(target_os = "linux")]
+    Media(folia_media::Command),
     BackgroundPainted(u64, Option<iced::widget::image::Handle>),
     BackgroundPicked(Option<std::path::PathBuf>),
     BackgroundLoaded(u64, std::path::PathBuf, Result<std::sync::Arc<image::RgbaImage>, String>),
     Navigate(Page),
     OpenSettings,
+    OpenWorkbench,
+    OpenThemePark,
+    ThemePark(theme_park::Message),
+    OpenScene,
     Settings(settings::Message),
+    SceneSettings(scene_settings::Message),
+    SceneSound(scene_sound::Message),
+    SceneFailed(folia_visualizer::cinema::Failure),
     Sources(sources::Message),
     /// Master switch for audio source fallback.
     UnlockEnabled(bool),
     /// Switch for one fallback audio source.
     UnlockToggle(folia_store::UnlockSource, bool),
+    SongTheme(song_theme::Message),
     /// The developer page, its log panel and the two overlays.
     Developer(developer::Message),
     Workbench(workbench::Message),
     LanguagePicked(LanguagePreference),
     Theme(ThemeMode),
+    FollowSystemTheme,
+    SystemTheme(iced::theme::Mode),
     FrameRate(FrameRate),
+    Graphics(graphics::Message),
+    SmartBeat(smart_beat::Message),
     /// A fixed lyric style, or `None` for a random style per song.
     Visualizer(Option<Style>),
     Library(library::Message),
     Search(search::Message),
+    Catalog(catalog::Message),
+    Back,
     Playback(playback::Message),
+    Session(playback_session::Message),
+    VisualFrame,
+    UiFrame,
     OpenFiles(Vec<Track>),
     Chrome(chrome::Message),
     /// The pointer moved in a window, or left it (`None`).
@@ -214,6 +276,7 @@ pub enum Message {
     PointerHeld(bool),
     /// The window lost focus; any press outside it will not report its release here.
     WindowUnfocused,
+    WindowClosing,
     RevealChrome,
     Bar(player_bar::Message),
     /// The bottom offset from settings, while its slider moves.
@@ -226,6 +289,7 @@ pub enum Message {
     ToggleFullscreen,
     SplashFrame,
     Home(home::Message),
+    Lattice(u64, lattice::Message),
     Panel(panel::Message),
     /// The playlist picker over the window.
     Playlists(playlist_dialog::Message),
@@ -299,6 +363,9 @@ const ART_BYTES: usize = 4 * 1024 * 1024;
 const ART_PX: u32 = 360;
 
 pub struct Shell {
+    storage: storage::Storage,
+    #[cfg(target_os = "linux")]
+    media_session: media_session::Bridge,
     store: Store,
     /// The page being left for or from the player fades out over the new one.
     page_fade: Option<page_fade::PageFade>,
@@ -308,6 +375,7 @@ pub struct Shell {
     general: GeneralSettings,
     appearance: AppearanceSettings,
     theme_settings: folia_store::ThemeSettings,
+    song_themes: song_theme::SongThemes,
     i18n: I18n,
     system_locale: Option<String>,
     theme: Theme,
@@ -316,15 +384,35 @@ pub struct Shell {
     settings: Option<settings::Settings>,
     sources: sources::Sources,
     workbench: Option<workbench::Workbench>,
+    theme_park: Option<theme_park::ThemePark>,
     visualizer: VisualizerSettings,
     developer: developer::Developer,
     developer_settings: folia_store::DeveloperSettings,
+    graphics: folia_store::GraphicsSettings,
+    scene: folia_store::SceneSettings,
+    scene_window: Option<scene_settings::State>,
+    scene_sound: scene_sound::SceneSound,
+    scene_generation: u64,
+    scene_failed: bool,
+    closing: bool,
+    smart_beat: smart_beat::State,
+    applied_gpu: folia_store::GpuPreference,
+    system_reduced_motion: bool,
+    system_motion_error: Option<String>,
+    visualizer_hold: Option<f64>,
+    native_blur_applied: bool,
+    native_blur_failed: bool,
     runtime_log: folia_store::RuntimeLog,
     memory_monitor: folia_store::MemoryMonitor,
     library: LibraryPage,
     search: SearchPage,
+    catalog: Option<catalog::CatalogPage>,
+    history: Vec<NavigationEntry>,
+    playback_source: Option<NavigationEntry>,
+    pending_playback_source: Option<(u64, NavigationEntry)>,
     omni: Option<Omni>,
     playback: Playback,
+    playback_session: playback_session::Session,
     play_navigation: PlaybackNavigation,
     /// The local playlists as last read or written, the liked-songs list first.
     playlists: Vec<folia_library::Playlist>,
@@ -361,6 +449,8 @@ pub struct Shell {
     drag_from: Option<(f32, f32)>,
     splash: splash::Splash,
     home: home::HomeChrome,
+    lattice: Option<lattice::Lattice>,
+    lattice_generation: u64,
     panel: panel::PlayerPanel,
     art: folia_library::CoverCache<i64, iced::widget::image::Handle>,
     art_pending: Option<(i64, u64)>,
@@ -398,11 +488,110 @@ pub struct Shell {
     system_fonts: Vec<String>,
 }
 
+struct UiFrames {
+    settings: bool,
+    login: bool,
+    timeline: bool,
+    splash: bool,
+    notice: bool,
+    online: bool,
+    bar: bool,
+    chrome: bool,
+    home: bool,
+    library: bool,
+    panel: bool,
+    status: bool,
+    catalog: bool,
+    search: bool,
+}
+
+impl UiFrames {
+    fn active(&self) -> bool {
+        [
+            self.settings,
+            self.login,
+            self.timeline,
+            self.splash,
+            self.notice,
+            self.online,
+            self.bar,
+            self.chrome,
+            self.home,
+            self.library,
+            self.panel,
+            self.status,
+            self.catalog,
+            self.search,
+        ]
+        .into_iter()
+        .any(|active| active)
+    }
+}
+
 impl Shell {
+    fn ui_frames(&self, now: std::time::Instant) -> UiFrames {
+        UiFrames {
+            settings: self.settings.as_ref().is_some_and(settings::Settings::animating),
+            login: self.login.animating(now),
+            timeline: self.timeline.is_open() && self.timeline.animating(now),
+            splash: self.splash.showing(now),
+            notice: self.playback.notice_animating(now),
+            online: self.library.online.sync_notice_animating(now),
+            bar: self.page != Page::Search
+                && (self.bar.animating(now) || self.subtitle_presence.running(self.now_ms())),
+            chrome: self.page_fade.as_ref().is_some_and(|fade| fade.running(now)) || self.titlebar.animating(now),
+            home: self.page == Page::Lattice && self.home.animating(now)
+                || matches!(self.page, Page::Library | Page::Lattice)
+                    && (self.home.scrolling(now) || self.home.tools_open() && self.song_themes.generating),
+            library: self.page == Page::Library
+                && (self.home.animating(now)
+                    || self.library.coasting()
+                    || self.library.hint_busy(now)
+                    || self.seam_flip.is_some()),
+            panel: self.page == Page::NowPlaying && self.panel.controls_animating(now),
+            status: self.status.is_some(),
+            catalog: self.page == Page::Catalog && self.catalog.as_ref().is_some_and(|page| page.animating(now)),
+            search: self.page == Page::Search && (self.search.animating(now) || self.search.spinning()),
+        }
+    }
+
+    fn advance_ui_frames(&mut self) -> Task<Message> {
+        let frames = self.ui_frames(std::time::Instant::now());
+        if !frames.active() {
+            return Task::none();
+        }
+        let mut run = |active, message| if active { self.handle(message) } else { Task::none() };
+        Task::batch([
+            run(frames.settings, Message::Settings(settings::Message::Frame)),
+            run(frames.login, Message::Login(login::Message::Frame)),
+            run(frames.timeline, Message::Timeline(timeline::Message::Frame)),
+            run(frames.splash, Message::SplashFrame),
+            run(frames.notice, Message::Playback(playback::Message::NoticeFrame)),
+            run(frames.online, Message::Library(library::Message::Online(online::Message::SyncFrame))),
+            run(frames.bar, Message::Bar(player_bar::Message::Frame)),
+            run(frames.chrome, Message::Chrome(chrome::Message::Frame)),
+            run(frames.home, Message::Home(home::Message::Frame)),
+            run(frames.library, Message::Library(library::Message::Frame)),
+            run(frames.panel, Message::Panel(panel::Message::Frame)),
+            run(frames.status, Message::StatusFrame),
+            run(frames.catalog, Message::Catalog(catalog::Message::Frame)),
+            run(frames.search, Message::Search(search::Message::Frame)),
+        ])
+    }
+
     pub fn new(init: Init) -> (Self, Task<Message>) {
+        let storage = storage::Storage::new(init.storage, init.cache_dir);
+        #[cfg(target_os = "linux")]
+        let media_session = media_session::Bridge::new(storage.active.clone());
         typeface::language(init.i18n.language());
-        let theme = theme_for(&init.theme, init.appearance.theme, init.appearance.animation_intensity);
-        let omni = Omni::new(init.cache_dir, init.keyring_service)
+        motion::configure(&init.graphics.motion, init.system_reduced_motion);
+        let smart_beat =
+            smart_beat::State::new(&init.visualizer, init.analysis_models.clone(), init.data_dir.join("analysis.db"));
+        let (scene_sound, scene_sound_task) = scene_sound::SceneSound::new(storage.active.clone());
+        let theme = theme_for(&init.theme, init.appearance.theme, init.appearance.animation_intensity, None);
+        let (song_themes, theme_load) =
+            song_theme::SongThemes::new(init.store.clone(), init.data_dir.clone(), init.keyring_service.clone());
+        let omni = Omni::new(storage.active.clone(), init.keyring_service)
             .inspect_err(|err| tracing::error!(error = err as &dyn std::error::Error, "online music unavailable"))
             .ok();
         if let Some(omni) = &omni {
@@ -418,6 +607,7 @@ impl Shell {
             init.general.home_tab,
             omni.clone(),
             init.general.online_provider.as_deref(),
+            init.general.wall_randomize_on_entry,
         );
         let mut home = home::HomeChrome::new(INITIAL_WINDOW.width);
         home.restore_queue_island(init.general.wall_tools_queue_island_open);
@@ -435,13 +625,20 @@ impl Shell {
             memory_monitor.start(init.developer.interval_ms());
             developer.refresh_memory(memory_monitor.history());
         }
+        let playback = Playback::new(init.playback, omni.clone());
+        let playback_session = playback_session::Session::new(&playback, init.open_files.is_empty());
         let mut shell = Self {
+            #[cfg(target_os = "linux")]
+            media_session,
             store: init.store,
             general: init.general,
+            lattice: None,
+            lattice_generation: 0,
             iced_theme: iced_theme(&theme),
             theme,
             appearance: init.appearance,
             theme_settings: init.theme,
+            song_themes,
             i18n: init.i18n,
             system_locale: init.system_locale,
             page: Page::Library,
@@ -451,14 +648,35 @@ impl Shell {
             settings: None,
             sources: sources::Sources::default(),
             workbench: None,
+            theme_park: None,
             visualizer: init.visualizer,
             developer,
             developer_settings: init.developer,
+            applied_gpu: init.graphics.gpu_preference,
+            graphics: init.graphics,
+            scene: init.scene,
+            scene_window: None,
+            scene_sound,
+            scene_generation: 0,
+            scene_failed: false,
+            closing: false,
+            smart_beat,
+            system_reduced_motion: init.system_reduced_motion,
+            system_motion_error: None,
+            visualizer_hold: None,
+            native_blur_applied: false,
+            native_blur_failed: false,
             runtime_log: init.runtime_log,
             memory_monitor,
             library,
             search: SearchPage::default(),
-            playback: Playback::new(init.playback, omni.clone()),
+            catalog: None,
+            history: Vec::new(),
+            playback_source: None,
+            storage,
+            pending_playback_source: None,
+            playback,
+            playback_session,
             play_navigation: PlaybackNavigation::default(),
             playlists: Vec::new(),
             db_path: db_path.clone(),
@@ -529,14 +747,126 @@ impl Shell {
             Message::FontsLoaded(fonts.unwrap_or_default())
         });
         let sources = shell.sources.restore(shell.omni.clone(), shell.store.clone(), shell.data_dir.clone());
+        let motion = if shell.graphics.motion.follow_system { graphics::poll() } else { Task::none() };
+        let restore = playback_session::load(shell.store.clone());
         (
             shell,
-            Task::batch([load.map(Message::Library), open, window, portrait, background, playlists, fonts, sources]),
+            Task::batch([
+                load.map(Message::Library),
+                open,
+                window,
+                portrait,
+                background,
+                playlists,
+                fonts,
+                sources,
+                motion,
+                theme_load,
+                iced::system::theme().map(Message::SystemTheme),
+                scene_sound_task,
+                restore,
+            ]),
         )
+    }
+
+    fn open_workbench(&mut self) -> Task<Message> {
+        let mut window = workbench::Workbench::open();
+        window.values = self.tuning_of(self.style());
+        let task = window.load_art().map(Message::Workbench);
+        self.workbench = Some(window);
+        task
+    }
+
+    fn workbench_look(&self) -> workbench::Look<'_> {
+        let style = self.style();
+        let daylight = self.theme_is_light();
+        let smart_beat = self.smart_beat.view(self.playback.heard_position());
+        let live = self.playback.current().map(|track| workbench::Live {
+            smart_beat: smart_beat.sample,
+            lyrics: self.playback.lyrics.as_ref().unwrap_or(&self.empty_lyrics),
+            time: self.playback.lyric_time(),
+            track: Some(track),
+            seed: &self.visualizer_seed,
+            audio: &self.audio,
+            portrait: self.art.peek(&track.id).and_then(Option::as_ref),
+            colors: self.cover_palettes.get(track.id).unwrap_or(&[]),
+            source: self.background_cover.as_ref().filter(|(id, _)| *id == track.id).map(|(_, image)| image),
+        });
+        workbench::Look {
+            smart_beat,
+            portrait: self.portrait_handle(self.playback.current().map(|track| track.id)),
+            i18n: &self.i18n,
+            theme: &self.theme,
+            daylight,
+            window: self.window_size,
+            style,
+            font_scale: self.appearance.lyrics_font_scale,
+            live,
+            audio: &self.audio,
+            appearance: &self.appearance,
+            graphics: &self.graphics,
+            fonts: &self.system_fonts,
+            dpi: self.window_scale,
+            latent: folia_visualizer::LatentTuning::read(self.visualizer.tables.get("latent_background_tuning")),
+            sora: folia_visualizer::SoraTuning::read(self.visualizer.tables.get("sora_background_tuning")),
+            monet: folia_visualizer::monet_background::Tuning::read(
+                self.visualizer.tables.get("monet_background_tuning"),
+            ),
+            picture: self.background_poster.image(),
+            nomand: folia_visualizer::nomand::Tuning::read(self.visualizer.tables.get("nomand_background_tuning")),
+            cover: self.playback.current().and_then(|track| self.cover_palettes.get(track.id)).unwrap_or(&[]),
+            has_background_upload: self.background_upload.is_some(),
+        }
+    }
+
+    fn refresh_theme(&mut self) {
+        self.theme = theme_for(
+            &self.theme_settings,
+            self.appearance.theme,
+            self.appearance.animation_intensity,
+            self.song_themes.applied.as_ref(),
+        );
+        self.iced_theme = iced_theme(&self.theme);
+    }
+
+    fn scene_settings(&mut self, message: scene_settings::Message) -> Task<Message> {
+        use scene_settings::Message as Change;
+        if let Some(window) = &mut self.scene_window {
+            window.update(&message);
+        }
+        match message {
+            Change::Close => {
+                self.scene_window = None;
+                return Task::none();
+            }
+            Change::Tab(_) => return Task::none(),
+            Change::Select(scene) => {
+                if self.scene.scene_id != scene || self.scene_failed {
+                    self.scene_generation = self.scene_generation.wrapping_add(1);
+                    self.scene_failed = false;
+                    self.scene.scene_id = scene;
+                }
+            }
+            Change::Quality(quality) => self.scene.scene_options.cinema.quality = quality,
+            Change::Seat(seat) => self.scene.scene_options.cinema.viewpoint = seat,
+            Change::HouseLights(on) => self.scene.scene_options.cinema.house_lights = on,
+            Change::Curtains(on) => self.scene.scene_options.cinema.curtains_on_pause = on,
+            Change::Sound(on) => self.scene.scene_room_sound = on,
+            Change::Output(output) => self.scene.scene_room_output = output,
+            Change::Reset => {
+                self.scene.scene_options.cinema = Default::default();
+                self.scene_generation = self.scene_generation.wrapping_add(1);
+                self.scene_failed = false;
+            }
+        }
+        save(&self.store, &self.scene)
     }
 
     fn portrait_handle(&self, id: Option<i64>) -> Option<&iced::widget::image::Handle> {
         let values = Style::Monet.load(&self.visualizer.tables);
+        if values.choice(Style::Monet.manifest(), "portraitSource") == "none" {
+            return None;
+        }
         if values.choice(Style::Monet.manifest(), "portraitSource") == "custom"
             && let Some((_, handle)) = &self.monet_portrait
         {
@@ -617,7 +947,9 @@ impl Shell {
             });
         }
         values.set_path(manifest, "portraitPath", None);
-        values.set_choice(manifest, "portraitSource", "cover");
+        if values.choice(manifest, "portraitSource") == "custom" {
+            values.set_choice(manifest, "portraitSource", "cover");
+        }
         self.monet_portrait = None;
         if self.style() == Style::Monet
             && let Some(window) = self.workbench.as_mut()
@@ -653,12 +985,45 @@ impl Shell {
         self.iced_theme.clone()
     }
 
+    pub fn window_style(&self, _theme: &iced::Theme) -> iced::theme::Style {
+        iced::theme::Style {
+            background_color: if self.player_transparent() {
+                Color::TRANSPARENT
+            } else {
+                folia_visualizer::color(self.theme.background, 1.0)
+            },
+            text_color: folia_visualizer::color(self.theme.primary, 1.0),
+        }
+    }
+
+    fn player_transparent(&self) -> bool {
+        self.page == Page::NowPlaying && (self.theme_settings.transparent_player_background || self.native_blur_applied)
+    }
+
+    pub(crate) fn scene_active(&self) -> bool {
+        self.page == Page::NowPlaying && self.scene.scene_id.is_some() && !self.scene_failed && !self.closing
+    }
+
     pub fn update(&mut self, message: Message) -> Task<Message> {
+        if self.closing {
+            return match message {
+                Message::Session(message) => self.playback_session.update(message, &mut self.playback, &self.store),
+                _ => Task::none(),
+            };
+        }
+        let seek_finished = matches!(message, Message::Playback(playback::Message::SeekDone));
+        motion::configure(&self.graphics.motion, self.system_reduced_motion);
+        if self.graphics.background_throttling && folia_render::backend::window_hidden() {
+            self.visualizer_hold.get_or_insert_with(|| self.playback.lyric_time());
+        } else {
+            self.visualizer_hold = None;
+        }
         let transient = message.is_transient();
         if !transient {
             self.refresh_panel_data();
         }
         let before = self.page;
+        let wall_seed = self.library.order_seed();
         let settles_page = matches!(message, Message::PageShot(_) | Message::PageShotDone);
         let seam_before = self.seam_before(&message);
         let opens_search = matches!(&message, Message::Home(home::Message::Search));
@@ -666,17 +1031,88 @@ impl Shell {
         // The original analyser is read once per animation frame; its 0.6 smoothing assumes that rate.
         let frame_tick = matches!(
             message,
-            Message::Playback(playback::Message::Tick) | Message::Workbench(workbench::Message::Frame)
+            Message::VisualFrame
+                | Message::Playback(playback::Message::Tick)
+                | Message::Workbench(workbench::Message::Frame)
         );
+        let lyrics_settled = matches!(&message, Message::Playback(playback::Message::LyricsLoaded(request, ..)) if *request == self.playback.request_id());
         let task = self.handle(message);
+        #[cfg(target_os = "linux")]
+        self.media_session.sync(
+            &self.playback,
+            self.playback.current().and_then(|track| self.art.peek(&track.id)).and_then(Option::as_ref),
+        );
+        if self.closing {
+            return task;
+        }
+        let entered_wall =
+            if before != Page::Library && self.page == Page::Library && self.library.order_seed() == wall_seed {
+                self.library.enter_wall(&self.i18n).map(Message::Library)
+            } else {
+                Task::none()
+            };
+        let task = Task::batch([task, entered_wall]);
+        let wall = self.library.wall_appearance(self.appearance.wall, &self.i18n).map(Message::Library);
+        let lattice_task = if self.page == Page::Lattice {
+            let handoff = (before == Page::Library).then(|| self.library.take_handoff());
+            let generation = self.lattice_generation;
+            let lattice = self.lattice.get_or_insert_with(Default::default);
+            if let Some(handoff) = handoff {
+                lattice.enter(handoff);
+            }
+            lattice.set_randomize_on_entry(self.general.wall_randomize_on_entry);
+            lattice
+                .sync(&self.playback, self.appearance.wall, &self.i18n, self.omni.as_ref())
+                .map(move |message| Message::Lattice(generation, message))
+        } else {
+            if before == Page::Lattice
+                && self.page == Page::Library
+                && let Some(lattice) = &mut self.lattice
+            {
+                self.library.accept_handoff(lattice.leave());
+            }
+            if self.lattice.take().is_some() {
+                self.lattice_generation = self.lattice_generation.wrapping_add(1);
+            }
+            Task::none()
+        };
+        let covers = if self.page == Page::Lattice {
+            self.library.suspend_wall(true)
+        } else if matches!(self.page, Page::Library | Page::Search) {
+            self.library.suspend_wall(false)
+        } else {
+            Task::none()
+        };
+        let task = Task::batch([task, wall, lattice_task, covers.map(Message::Library)]);
+        let colors = self.playback.current().and_then(|track| self.cover_palettes.get(track.id)).unwrap_or(&[]);
+        let cover_ready = self.playback.current().is_some_and(|track| self.art.peek(&track.id).is_some());
+        let theme_task = self.song_themes.observe(&self.playback, colors, cover_ready, lyrics_settled);
+        let mut remember_theme = Task::none();
+        if self.song_themes.theme_changed {
+            self.song_themes.theme_changed = false;
+            if self.song_themes.applied.is_some() {
+                self.theme_settings.source = folia_store::ThemeSource::Ai;
+            }
+            self.refresh_theme();
+            remember_theme = Task::batch([self.song_themes.remember(), save(&self.store, &self.theme_settings)]);
+        }
+        let task = Task::batch([task, theme_task, remember_theme]);
+        if self.page != before {
+            self.scene_generation = self.scene_generation.wrapping_add(1);
+            self.scene_failed = false;
+        }
+        let scene_active = self.scene_active();
+        let room = self.scene_sound.sync(&self.scene, scene_active, &mut self.playback);
+        let task = Task::batch([task, room]);
         let task = if transient {
             task
         } else {
-            Task::batch([task, self.prepare_background(), self.playback.refresh_prefetch().map(Message::Playback)])
-        };
-        if !transient {
+            let task = Task::batch([task, self.prepare_background()]);
+            let task = Task::batch([task, self.prepare_preview_background()]);
+            let task = Task::batch([task, self.playback.refresh_prefetch().map(Message::Playback)]);
             self.refresh_visualizer_seed();
-        }
+            task
+        };
         if self.page != before || self.playback.current().is_none() {
             self.play_navigation.cancel();
         }
@@ -712,13 +1148,22 @@ impl Shell {
         if self.page != Page::NowPlaying {
             self.positioning = None;
         }
-        self.bar.set_home(self.page == Page::Library);
+        self.bar.set_home(matches!(self.page, Page::Library | Page::Lattice));
         self.home.sync(self.window_size.width, self.window_size.height, self.playback.current().is_some(), now);
-        self.home.sync_queue(
+        self.home.filter_queue(self.playback.queue.items(), self.playback.queue.revision());
+        let list_h = self.home.list_height(
+            self.window_size,
+            now,
+            self.playback.queue.items().len(),
+            self.page == Page::Lattice,
+            self.playback.is_fm() || self.appearance.wall.radio,
+        );
+        self.home.sync_queue_height(
             self.playback.queue.items(),
             self.playback.queue.current_index(),
             self.playback.is_fm(),
             now,
+            list_h,
         );
         if let Some(horizontal) = self.home.take_flip(now) {
             self.library.set_horizontal(horizontal);
@@ -727,6 +1172,24 @@ impl Shell {
         self.library.set_horizontal(self.home.is_horizontal());
         self.library.set_seam(self.home.width(now));
         self.library.plan_if_needed();
+        let wall_pointer = self.clock.pointer.map(|(x, y)| iced::Point::new(x, y)).filter(|at| {
+            matches!(self.page, Page::Library | Page::Lattice)
+                && !self.modal_open()
+                && !self.library.menu_open()
+                && !self.bar.hover().inside
+                && !self.home.covers_wall(
+                    *at,
+                    self.window_size,
+                    self.playback.queue.items().len(),
+                    (self.page == Page::Lattice, self.playback.is_fm() || self.appearance.wall.radio),
+                    self.playback.current().is_some(),
+                    now,
+                )
+        });
+        self.library.wall_pointer(wall_pointer.filter(|_| self.page == Page::Library), now);
+        if let Some(lattice) = &mut self.lattice {
+            lattice.pointer(wall_pointer, now);
+        }
         let seam = self.library.seam();
         self.home.sync_tab(self.home.is_hidden() || seam.collapsed, now);
         self.login.sync(&self.library.online);
@@ -734,7 +1197,9 @@ impl Shell {
         self.panel.sync_like(liked, now);
         self.library.set_tab_chrome(&mut self.home, now);
         self.library.sync_hint(&self.i18n, now);
-        self.bar.set_forced(self.positioning.is_some());
+        let radio_capsule =
+            self.lattice.as_ref().filter(|_| self.page == Page::Lattice).and_then(lattice::Lattice::radio_capsule);
+        self.bar.set_forced(self.positioning.is_some() || radio_capsule == Some(true));
         self.bar.sync(&self.playback, self.window_size.width, now);
         self.timeline.sync(
             timeline::Sync {
@@ -750,12 +1215,13 @@ impl Shell {
         self.bar.set_modal(self.modal_open());
         self.panel.set_modal(self.modal_open());
         if !self.modal_open() {
-            self.bar.set_shown(self.chrome_visible(), now);
+            self.bar.set_shown(self.chrome_visible() && radio_capsule != Some(false), now);
             let presence = if self.chrome_visible() { 1.0 } else { 0.0 };
             self.subtitle_presence = self.subtitle_presence.retarget(self.now_ms(), presence);
         }
         let (quality_levels, quality) = self.audio_quality();
         let room = panel::Room {
+            background: folia_visualizer::Background::resolve(self.appearance.stored_background_mode()),
             width: self.window_size.width,
             height: self.window_size.height,
             bottom: self.bar_offset(),
@@ -772,11 +1238,25 @@ impl Shell {
             focus_card::REVEAL_PAD
         };
         self.library.playing_id = self.playback.current().map(|track| track.id);
-        let reads_audio = self.page == Page::NowPlaying || self.workbench.is_some();
-        if reads_audio && (frame_tick || !self.playback.is_playing()) {
+        let reads_audio = self.page == Page::NowPlaying
+            || radio_capsule.is_some()
+            || self.wall_backdrop_visible()
+            || self.workbench.is_some()
+            || self.theme_park.is_some();
+        if reads_audio && self.visualizer_hold.is_none() && (frame_tick || !self.playback.is_playing()) {
             self.audio = self.playback.audio_frame(wall_ms());
         }
-        task
+        if self.page == Page::Lattice
+            && frame_tick
+            && let Some(lattice) = &mut self.lattice
+        {
+            lattice.sample_audio(&self.audio, now);
+        }
+        self.sync_native_blur();
+        let analysis = self.sync_smart_beat(frame_tick);
+        let session = self.playback_session.observe(&self.playback, &self.store, seek_finished);
+        let task = if analysis.units() == 0 { task } else { Task::batch([task, analysis]) };
+        if session.units() == 0 { task } else { Task::batch([task, session]) }
     }
 
     fn load_background(&self) -> Task<Message> {
@@ -822,9 +1302,13 @@ impl Shell {
 
     fn prepare_background(&mut self) -> Task<Message> {
         let mode = folia_visualizer::Background::resolve(self.appearance.stored_background_mode());
-        if !matches!(mode, folia_visualizer::Background::Monet | folia_visualizer::Background::Nomand) {
-            self.background_cover = None;
+        let common = mode == folia_visualizer::Background::Common && self.appearance.use_cover_color_bg;
+        if !common && !matches!(mode, folia_visualizer::Background::Monet | folia_visualizer::Background::Nomand) {
             self.background_poster.clear();
+            if self.scene_active() {
+                return self.ensure_art();
+            }
+            self.background_cover = None;
             return Task::none();
         }
         let art = self.ensure_art();
@@ -841,12 +1325,18 @@ impl Shell {
         } else {
             tuning.uploaded
         };
-        let source = if uploaded {
+        let source = if common {
+            cover
+        } else if uploaded {
             self.background_upload.as_ref().or(cover)
         } else {
             cover.or(self.background_upload.as_ref())
         };
-        let Some(job) = self.background_poster.request(source, &self.theme, tuning, raw) else { return art };
+        let Some(job) =
+            self.background_poster.request(source, &self.theme, tuning, raw, common.then_some(self.window_size))
+        else {
+            return art;
+        };
         let generation = job.generation;
         let painting = Task::perform(crate::background::blocking(move || job.paint()), move |image| {
             Message::BackgroundPainted(generation, image)
@@ -854,22 +1344,408 @@ impl Shell {
         Task::batch([art, painting])
     }
 
+    fn prepare_preview_background(&mut self) -> Task<Message> {
+        let cover = self
+            .background_cover
+            .as_ref()
+            .filter(|(id, _)| self.playback.current().is_some_and(|track| track.id == *id))
+            .map(|(_, image)| image);
+        let tuning =
+            folia_visualizer::monet_background::Tuning::read(self.visualizer.tables.get("monet_background_tuning"));
+        let nomand = folia_visualizer::nomand::Tuning::read(self.visualizer.tables.get("nomand_background_tuning"));
+        let (preview, theme) = if let Some(park) = &mut self.theme_park {
+            (&mut park.preview, &park.preview_theme)
+        } else if let Some(window) = &mut self.workbench {
+            (window, &self.theme)
+        } else {
+            return Task::none();
+        };
+        preview
+            .prepare_background(
+                theme,
+                &self.appearance,
+                tuning,
+                nomand,
+                (cover, self.background_upload.as_ref()),
+                self.window_size,
+            )
+            .map(Message::Workbench)
+    }
+
+    fn page_snapshot(&self) -> NavigationEntry {
+        match self.page {
+            Page::Search => NavigationEntry::Search(Box::new(self.search.snapshot())),
+            Page::Catalog => self.catalog.as_ref().map_or(NavigationEntry::Page(Page::Library), |page| {
+                NavigationEntry::Catalog(Box::new(page.snapshot()))
+            }),
+            page => NavigationEntry::Page(page),
+        }
+    }
+
+    fn remember_page(&mut self) {
+        let entry = match self.page {
+            Page::Catalog => match self.catalog.take() {
+                Some(mut page) => {
+                    page.suspend();
+                    NavigationEntry::Catalog(Box::new(page))
+                }
+                None => return,
+            },
+            Page::Search => {
+                let mut page = std::mem::take(&mut self.search);
+                page.suspend();
+                NavigationEntry::Search(Box::new(page))
+            }
+            page => NavigationEntry::Page(page),
+        };
+        self.history.push(entry);
+        if self.history.len() > 32 {
+            self.history.remove(0);
+        }
+    }
+
+    fn restore_page(&mut self, entry: NavigationEntry) -> Task<Message> {
+        match entry {
+            NavigationEntry::Catalog(page) => {
+                self.catalog = Some(*page);
+                self.page = Page::Catalog;
+                self.catalog
+                    .as_mut()
+                    .map_or_else(Task::none, |page| page.activate(self.omni.as_ref()).map(Message::Catalog))
+            }
+            NavigationEntry::Search(page) => {
+                self.search = *page;
+                self.page = Page::Search;
+                self.search.restore(self.omni.as_ref()).map(Message::Search)
+            }
+            NavigationEntry::Page(page) => {
+                self.page = page;
+                Task::none()
+            }
+        }
+    }
+
+    fn navigate_back(&mut self) -> Task<Message> {
+        if self.page == Page::Catalog && self.catalog.as_mut().is_some_and(|page| page.close_biography()) {
+            return Task::none();
+        }
+        self.play_navigation.cancel();
+        if let Some(page) = &mut self.catalog {
+            page.suspend();
+        }
+        self.catalog = None;
+        self.search.suspend();
+        let entry = self.history.pop().unwrap_or(NavigationEntry::Page(Page::Library));
+        self.restore_page(entry)
+    }
+
+    fn return_home(&mut self) {
+        self.play_navigation.cancel();
+        self.catalog = None;
+        self.search.suspend();
+        self.history.clear();
+        self.page = Page::Library;
+    }
+
+    fn locate_playback_source(&mut self) -> Task<Message> {
+        let entry = match &self.playback_source {
+            Some(NavigationEntry::Catalog(page)) => NavigationEntry::Catalog(Box::new(page.snapshot())),
+            Some(NavigationEntry::Search(page)) => NavigationEntry::Search(Box::new(page.snapshot())),
+            _ => {
+                let entered = if self.page != Page::Library {
+                    self.library.enter_wall(&self.i18n).map(Message::Library)
+                } else {
+                    Task::none()
+                };
+                self.page = Page::Library;
+                let located = match self.playback.current().map(|track| track.id) {
+                    Some(track) => self.library_message(library::Message::Locate(track)),
+                    None => Task::none(),
+                };
+                return Task::batch([entered, located]);
+            }
+        };
+        self.play_navigation.cancel();
+        self.remember_page();
+        self.restore_page(entry)
+    }
+
+    fn catalog_message(&mut self, message: catalog::Message) -> Task<Message> {
+        if matches!(message, catalog::Message::Back) {
+            return self.navigate_back();
+        }
+        if matches!(
+            message,
+            catalog::Message::TrackArtists(_)
+                | catalog::Message::TrackAlbum(_)
+                | catalog::Message::OpenArtist(_)
+                | catalog::Message::OpenAlbum(_)
+        ) {
+            let Some((page, task)) = catalog::CatalogPage::open(message, self.omni.as_ref()) else {
+                return Task::none();
+            };
+            self.play_navigation.cancel();
+            self.remember_page();
+            self.catalog = Some(page);
+            self.page = Page::Catalog;
+            return task.map(Message::Catalog);
+        }
+        if let catalog::Message::AllReady(_, _, enqueue, ref result) = message {
+            let active =
+                self.page == Page::Catalog && self.catalog.as_ref().is_some_and(|page| page.accepts_all(&message));
+            if !active {
+                return Task::none();
+            }
+            let succeeded = result.is_ok();
+            let task = self
+                .catalog
+                .as_mut()
+                .map_or_else(Task::none, |page| page.update(message.clone(), self.omni.as_ref()).map(Message::Catalog));
+            if succeeded {
+                return Task::batch([
+                    task,
+                    self.catalog_message(if enqueue {
+                        catalog::Message::EnqueueAll
+                    } else {
+                        catalog::Message::PlayAll
+                    }),
+                ]);
+            }
+            return task;
+        }
+        if matches!(message, catalog::Message::PlayAll | catalog::Message::EnqueueAll) {
+            let enqueue = matches!(message, catalog::Message::EnqueueAll);
+            if let Some(task) = self.catalog.as_mut().and_then(|page| page.prepare_all(enqueue, self.omni.as_ref())) {
+                return task.map(Message::Catalog);
+            }
+        }
+        if matches!(message, catalog::Message::Data(..) | catalog::Message::Cover(..) | catalog::Message::Backdrop(..))
+        {
+            if let Some(page) = self.catalog.as_mut().filter(|page| page.accepts(&message)) {
+                return page.update(message, self.omni.as_ref()).map(Message::Catalog);
+            }
+            for entry in &mut self.history {
+                if let NavigationEntry::Catalog(page) = entry
+                    && page.accepts(&message)
+                {
+                    return page.update(message, self.omni.as_ref()).map(Message::Catalog);
+                }
+            }
+            return Task::none();
+        }
+        let Some(page) = self.catalog.as_ref() else { return Task::none() };
+        match message {
+            catalog::Message::Play(_) | catalog::Message::PlayAll => {
+                let index = if let catalog::Message::Play(index) = message { index } else { 0 };
+                if page.tracks.is_empty() || index >= page.tracks.len() {
+                    return Task::none();
+                }
+                let origin = folia_core::Origin { name: page.title().to_owned() };
+                let start = self.playback.play(page.tracks.clone(), index, Some(origin)).map(Message::Playback);
+                self.await_player();
+                Task::batch([start, self.ensure_art()])
+            }
+            catalog::Message::Enqueue(index) => {
+                if let Some(track) = page.tracks.get(index).cloned() {
+                    self.playback.enqueue(vec![track]);
+                }
+                Task::none()
+            }
+            catalog::Message::EnqueueAll => {
+                self.playback.enqueue(page.tracks.clone());
+                Task::none()
+            }
+            message => self
+                .catalog
+                .as_mut()
+                .map_or_else(Task::none, |page| page.update(message, self.omni.as_ref()).map(Message::Catalog)),
+        }
+    }
+
     fn handle(&mut self, message: Message) -> Task<Message> {
         match message {
+            #[cfg(target_os = "linux")]
+            Message::Media(command) => self.media_command(command),
+            Message::UiFrame => {
+                let playback = if self.playback.is_playing() {
+                    self.handle(Message::Playback(playback::Message::Tick))
+                } else {
+                    Task::none()
+                };
+                Task::batch([playback, self.advance_ui_frames()])
+            }
+            Message::VisualFrame => {
+                let playback = self.handle(Message::Playback(playback::Message::Tick));
+                let ui = self.advance_ui_frames();
+                let lattice = if self.page == Page::Lattice {
+                    self.handle(Message::Lattice(self.lattice_generation, lattice::Message::Frame))
+                } else {
+                    Task::none()
+                };
+                let preview = if self.workbench.as_ref().is_some_and(workbench::Workbench::ticking)
+                    || self.theme_park.as_ref().is_some_and(|park| park.preview.ticking())
+                {
+                    self.handle(Message::Workbench(workbench::Message::Frame))
+                } else {
+                    Task::none()
+                };
+                let panel = if self.page == Page::NowPlaying && self.panel.visualizing() {
+                    self.panel(panel::Message::Frame)
+                } else {
+                    Task::none()
+                };
+                if preview.units() == 0 && panel.units() == 0 && lattice.units() == 0 && ui.units() == 0 {
+                    playback
+                } else {
+                    Task::batch([playback, preview, panel, lattice, ui])
+                }
+            }
+            Message::SceneSound(message) => self.scene_sound.update(message, &mut self.playback),
+            Message::SceneFailed(failure) => {
+                if failure.generation == self.scene_generation && self.scene_active() {
+                    tracing::error!(error = &failure.error as &dyn std::error::Error, "scene renderer failed");
+                    self.scene_failed = true;
+                }
+                Task::none()
+            }
+            Message::Back => self.navigate_back(),
+            Message::Catalog(message) => self.catalog_message(message),
             Message::Navigate(page) => {
                 self.play_navigation.cancel();
+                if page == Page::Library {
+                    self.return_home();
+                    return Task::none();
+                }
+                if page == Page::NowPlaying && self.page != Page::NowPlaying {
+                    self.remember_page();
+                }
                 self.page = page;
                 if page == Page::NowPlaying {
                     self.reveal_chrome();
                 }
                 Task::none()
             }
+            Message::OpenWorkbench => self.open_workbench(),
+            Message::OpenThemePark => {
+                let lyrics = self
+                    .playback
+                    .lyrics
+                    .as_ref()
+                    .map(|lyrics| lyrics.lines.iter().map(|line| line.text.as_str()).collect::<Vec<_>>().join("\n"))
+                    .unwrap_or_default();
+                let title = self.playback.current().map_or("", |track| track.title.as_str());
+                let mut park = theme_park::ThemePark::open(
+                    self.song_themes.current.as_ref().or(self.song_themes.applied.as_ref()),
+                    self.theme_settings.custom_dual_theme.as_ref(),
+                    self.theme_settings.source != folia_store::ThemeSource::Ai,
+                    self.theme_is_light(),
+                    self.playback.current().map(folia_ai::song_key),
+                    folia_ai::theme_prompt(title, &lyrics),
+                );
+                park.preview.values = self.tuning_of(self.style());
+                park.preview_theme.intensity = self.appearance.animation_intensity;
+                let task = park.preview.load_art().map(Message::Workbench);
+                self.theme_park = Some(park);
+                task
+            }
+            Message::ThemePark(message) => {
+                let Some(park) = self.theme_park.as_mut() else {
+                    return Task::none();
+                };
+                match park.update(message) {
+                    theme_park::Event::None => Task::none(),
+                    theme_park::Event::Close => {
+                        self.theme_park = None;
+                        Task::none()
+                    }
+                    theme_park::Event::Copy(text) => iced::clipboard::write(text),
+                    theme_park::Event::Save { custom, theme, song } => {
+                        let theme = *theme;
+                        self.theme_park = None;
+                        if custom {
+                            self.sheet_event(panel_sheets::Event::SaveTheme(theme))
+                        } else if let Some(song) = song {
+                            self.song_themes.save_manual(song, theme)
+                        } else {
+                            Task::none()
+                        }
+                    }
+                }
+            }
+            Message::OpenScene => {
+                self.scene_window = Some(scene_settings::State::open());
+                Task::none()
+            }
+            Message::SceneSettings(message) => self.scene_settings(message),
             Message::OpenSettings => {
                 self.settings = Some(settings::Settings::open());
                 Task::none()
             }
-            Message::Workbench(message) => self.workbench(message),
-            Message::Sources(message) => self.sources.update(message, self.omni.clone()),
+            Message::Workbench(message) => {
+                let style = self.style();
+                if matches!(message, workbench::Message::Pause | workbench::Message::Source(workbench::Source::Live)) {
+                    let live = self.playback.current().map(|track| workbench::Live {
+                        smart_beat: self.smart_beat.frame(self.playback.heard_position()),
+                        lyrics: self.playback.lyrics.as_ref().unwrap_or(&self.empty_lyrics),
+                        time: self.playback.lyric_time(),
+                        track: Some(track),
+                        seed: &self.visualizer_seed,
+                        audio: &self.audio,
+                        portrait: self.art.peek(&track.id).and_then(Option::as_ref),
+                        colors: self.cover_palettes.get(track.id).unwrap_or(&[]),
+                        source: self
+                            .background_cover
+                            .as_ref()
+                            .filter(|(id, _)| *id == track.id)
+                            .map(|(_, image)| image),
+                    });
+                    let choosing_live = matches!(message, workbench::Message::Source(workbench::Source::Live));
+                    if let Some(park) = &mut self.theme_park {
+                        park.preview.capture_live(live, choosing_live);
+                    } else if let Some(window) = &mut self.workbench {
+                        window.capture_live(live, choosing_live);
+                    }
+                }
+                if let Some(park) = self.theme_park.as_mut() {
+                    let latent =
+                        folia_visualizer::LatentTuning::read(self.visualizer.tables.get("latent_background_tuning"));
+                    let _ = park.preview.update(message, style.manifest(), &self.appearance, latent);
+                    Task::none()
+                } else {
+                    self.workbench(message)
+                }
+            }
+            Message::Sources(message) => {
+                let before = self.sources.custom_only();
+                let task = self.sources.update(message, self.omni.clone());
+                if before == self.sources.custom_only() {
+                    return task;
+                }
+                if self.sources.custom_only() {
+                    self.login.close();
+                }
+                self.play_navigation.cancel();
+                Task::batch([task, self.playback.source_mode_changed().map(Message::Playback)])
+            }
+            Message::SongTheme(message) => {
+                let prefer_custom = matches!(message, song_theme::Message::PreferCustom(true));
+                let loaded = matches!(message, song_theme::Message::Loaded(..));
+                let failure = self.song_themes.active_error(&message);
+                let colors = self.playback.current().and_then(|track| self.cover_palettes.get(track.id)).unwrap_or(&[]);
+                let task = self.song_themes.update(message, &self.store, &self.playback, colors);
+                if loaded {
+                    self.refresh_theme();
+                }
+                if prefer_custom && self.theme_settings.custom_dual_theme.is_some() {
+                    self.theme_settings.source = folia_store::ThemeSource::Custom;
+                    self.refresh_theme();
+                }
+                if failure {
+                    let notice = self.status(false, self.i18n.t("status.themeGenerationFailed").to_owned());
+                    return Task::batch([task, notice]);
+                }
+                task
+            }
             Message::UnlockEnabled(enabled) => {
                 self.unlock.set_enabled(enabled);
                 self.unlock_changed()
@@ -879,6 +1755,10 @@ impl Shell {
                 self.unlock_changed()
             }
             Message::Settings(message) => {
+                if self.sheets.any_open() && matches!(message, settings::Message::Escape) {
+                    self.sheets.close_all();
+                    return Task::none();
+                }
                 if self.sources.has_alert() && matches!(message, settings::Message::Escape) {
                     return self.sources.update(sources::Message::DismissUpdates, self.omni.clone());
                 }
@@ -890,11 +1770,46 @@ impl Shell {
                 task
             }
             Message::Developer(message) => self.developer(message),
+            Message::Storage(message) => self.storage_message(message),
             Message::LanguagePicked(preference) => self.set_language(preference),
             Message::Theme(mode) => {
                 let before = self.appearance.clone();
+                self.appearance.follow_system_theme = false;
                 self.appearance.theme = mode;
-                self.theme = theme_for(&self.theme_settings, mode, self.appearance.animation_intensity);
+                self.theme = theme_for(
+                    &self.theme_settings,
+                    mode,
+                    self.appearance.animation_intensity,
+                    self.song_themes.applied.as_ref(),
+                );
+                self.iced_theme = iced_theme(&self.theme);
+                self.appearance_changed(&before)
+            }
+            Message::FollowSystemTheme => {
+                let before = self.appearance.clone();
+                self.appearance.follow_system_theme = true;
+                Task::batch([self.appearance_changed(&before), iced::system::theme().map(Message::SystemTheme)])
+            }
+            Message::SystemTheme(mode) => {
+                if !self.appearance.follow_system_theme {
+                    return Task::none();
+                }
+                let mode = match mode {
+                    iced::theme::Mode::Light => ThemeMode::Light,
+                    iced::theme::Mode::Dark => ThemeMode::Dark,
+                    iced::theme::Mode::None => return Task::none(),
+                };
+                if self.appearance.theme == mode {
+                    return Task::none();
+                }
+                let before = self.appearance.clone();
+                self.appearance.theme = mode;
+                self.theme = theme_for(
+                    &self.theme_settings,
+                    mode,
+                    self.appearance.animation_intensity,
+                    self.song_themes.applied.as_ref(),
+                );
                 self.iced_theme = iced_theme(&self.theme);
                 self.appearance_changed(&before)
             }
@@ -903,9 +1818,17 @@ impl Shell {
                 self.appearance.frame_rate = rate;
                 self.appearance_changed(&before)
             }
+            Message::Graphics(message) => self.graphics_message(message),
+            Message::SmartBeat(message) => {
+                self.smart_beat.update(message);
+                Task::none()
+            }
             Message::Visualizer(style) => {
                 self.appearance.visualizer = style.map_or(RANDOM_STYLE, Style::id).to_owned();
                 save(&self.store, &self.appearance)
+            }
+            Message::Library(library::Message::Key(key)) if self.page == Page::Lattice => {
+                self.handle(Message::Lattice(self.lattice_generation, lattice::Message::Key(key)))
             }
             Message::Library(message) => {
                 let like_notice = match &message {
@@ -929,7 +1852,13 @@ impl Shell {
                 let frames = matches!(message, library::Message::Frame);
                 let queue_task = if frames {
                     let queue = self.playback.queue.items();
-                    let list_h = queue_island::list_height(queue.len());
+                    let list_h = self.home.list_height(
+                        self.window_size,
+                        std::time::Instant::now(),
+                        queue.len(),
+                        self.page == Page::Lattice,
+                        self.playback.is_fm() || self.appearance.wall.radio,
+                    );
                     let now = std::time::Instant::now();
                     self.home
                         .queue_frame(queue, self.playback.queue.current_index(), list_h, now)
@@ -949,9 +1878,24 @@ impl Shell {
                 Task::batch([queue_task, task, self.library_effect(effect), notice])
             }
             Message::Search(message) => {
+                if matches!(
+                    message,
+                    search::Message::Results(..) | search::Message::More(..) | search::Message::Cover(..)
+                ) && !self.search.accepts_message(&message)
+                {
+                    let provider = self.library.online.provider();
+                    for entry in &mut self.history {
+                        if let NavigationEntry::Search(page) = entry
+                            && page.accepts_message(&message)
+                        {
+                            return page.update(message, self.omni.as_ref(), provider).0.map(Message::Search);
+                        }
+                    }
+                    return Task::none();
+                }
                 if matches!(message, search::Message::Close) {
                     self.play_navigation.cancel();
-                    self.search.close();
+                    return self.navigate_back();
                 }
                 let now = std::time::Instant::now();
                 if matches!(message, search::Message::Frame) && self.page == Page::Search && self.search.gone(now) {
@@ -977,6 +1921,7 @@ impl Shell {
                         }
                         task
                     }
+                    search::Outcome::Catalog(message) => Task::batch([task, self.catalog_message(message)]),
                     search::Outcome::None => task,
                 }
             }
@@ -990,8 +1935,16 @@ impl Shell {
                 };
                 let task = self.playback.update(message, &self.store).map(Message::Playback);
                 if started.is_some_and(|request| {
+                    self.pending_playback_source.as_ref().is_some_and(|(pending, _)| *pending == request)
+                }) {
+                    self.playback_source = self.pending_playback_source.take().map(|(_, source)| source);
+                }
+                if started.is_some_and(|request| {
                     request == self.playback.request_id() && self.play_navigation.ready(request, self.page)
                 }) {
+                    if self.page != Page::NowPlaying {
+                        self.remember_page();
+                    }
                     self.page = Page::NowPlaying;
                     self.reveal_chrome();
                 }
@@ -1063,12 +2016,27 @@ impl Shell {
                 if self.page == Page::NowPlaying {
                     self.reveal_chrome();
                 }
-                if held { Task::none() } else { self.finish_slider() }
+                if held {
+                    Task::none()
+                } else {
+                    let radio = self.lattice.as_mut().map_or_else(Task::none, |lattice| {
+                        lattice
+                            .release_radio(self.clock.pointer.map(|(x, y)| iced::Point::new(x, y)), self.omni.as_ref())
+                    });
+                    let generation = self.lattice_generation;
+                    Task::batch([self.finish_slider(), radio.map(move |message| Message::Lattice(generation, message))])
+                }
             }
             Message::WindowUnfocused => {
+                self.pointer_held = false;
                 self.drag_armed = false;
                 self.drag_from = None;
                 self.finish_slider()
+            }
+            Message::WindowClosing => self.request_close(),
+            Message::Session(message) => {
+                let task = self.playback_session.update(message, &mut self.playback, &self.store);
+                Task::batch([task, self.ensure_art()])
             }
             Message::RevealChrome => {
                 if self.page == Page::NowPlaying {
@@ -1091,6 +2059,9 @@ impl Shell {
                 }
                 // `usePlayerBottomBarPositioningEntry`: close settings, go to the player, enter the mode.
                 self.settings = None;
+                if self.page != Page::NowPlaying {
+                    self.remember_page();
+                }
                 self.page = Page::NowPlaying;
                 self.reveal_chrome();
                 self.positioning = Some(positioner::Positioning::new(self.bar_offset()));
@@ -1101,7 +2072,8 @@ impl Shell {
                 self.positioner(if commit { positioner::Message::Commit } else { positioner::Message::Cancel })
             }
             Message::Bar(player_bar::Message::Open) => {
-                if self.page == Page::Library {
+                if self.page != Page::NowPlaying {
+                    self.remember_page();
                     self.page = Page::NowPlaying;
                     self.reveal_chrome();
                 }
@@ -1134,6 +2106,19 @@ impl Shell {
                 Task::none()
             }
             Message::Home(message) => self.home(message),
+            Message::Lattice(generation, message)
+                if self.page == Page::Lattice && generation == self.lattice_generation =>
+            {
+                let Some(page) = self.lattice.as_mut() else {
+                    return Task::none();
+                };
+                let (task, effect) = page.update(message, self.omni.as_ref());
+                Task::batch([
+                    task.map(move |message| Message::Lattice(generation, message)),
+                    effect.map_or_else(Task::none, |message| self.handle(message)),
+                ])
+            }
+            Message::Lattice(..) => Task::none(),
             Message::Panel(message) => {
                 let task = self.panel(message);
                 Task::batch([task, self.ensure_art()])
@@ -1314,7 +2299,9 @@ impl Shell {
             Message::Pointer(window, at) if self.window == Some(window) => match at {
                 Some(at) => {
                     self.developer.pointer(at, self.window_size);
-                    self.chrome(chrome::Message::Activity { x: at.x, y: at.y })
+                    let activity = self.chrome(chrome::Message::Activity { x: at.x, y: at.y });
+                    let drag = self.drag_move(window, at.x, at.y);
+                    Task::batch([activity, drag])
                 }
                 None => self.chrome(chrome::Message::Left),
             },
@@ -1334,7 +2321,7 @@ impl Shell {
                 } else if self.panel.is_open() {
                     self.panel(panel::Message::Close)
                 } else {
-                    self.handle(Message::Navigate(Page::Library))
+                    self.navigate_back()
                 }
             }
             Message::PlayerComposing(composing) => {
@@ -1342,6 +2329,7 @@ impl Shell {
                 Task::none()
             }
             Message::Timeline(message) => self.timeline(message),
+            Message::Login(_) if self.sources.custom_only() => Task::none(),
             Message::Login(message) => {
                 let (task, effect) = self.login.update(
                     message,
@@ -1398,7 +2386,10 @@ impl Shell {
 
     /// The sign-in window on `provider`, from the home page when the player's account tab asks for it.
     fn open_login_on(&mut self, provider: Option<&'static str>) -> Task<Message> {
-        self.page = Page::Library;
+        if self.sources.custom_only() {
+            return Task::none();
+        }
+        self.return_home();
         self.login.open(provider, &self.library.online, self.omni.as_ref()).map(Message::Login)
     }
 
@@ -1430,10 +2421,14 @@ impl Shell {
 
     /// Another platform takes over: the player empties, as a sign-out does, since its songs belong to the old one.
     fn leave_provider(&mut self) -> Task<Message> {
+        self.history.clear();
+        self.catalog = None;
+        self.search = SearchPage::default();
+        self.playback_source = None;
+        self.pending_playback_source = None;
+        self.play_navigation.cancel();
         self.playback.clear();
-        if self.page == Page::NowPlaying {
-            self.page = Page::Library;
-        }
+        self.page = Page::Library;
         Task::none()
     }
 
@@ -1448,6 +2443,7 @@ impl Shell {
 
     fn await_player(&mut self) {
         if self.playback.current().is_some() {
+            self.pending_playback_source = Some((self.playback.request_id(), self.page_snapshot()));
             self.play_navigation.begin(self.playback.request_id(), self.page);
         } else {
             self.play_navigation.cancel();
@@ -1457,6 +2453,7 @@ impl Shell {
     /// Plays what the home wall chose, or keeps the tab it switched to.
     fn library_effect(&mut self, effect: Option<library::Effect>) -> Task<Message> {
         match effect {
+            Some(library::Effect::Catalog(message)) => self.catalog_message(message),
             Some(library::Effect::Play { queue, index, origin }) => {
                 let name = origin.unwrap_or_else(|| self.i18n.t("localMusic.allSongs").to_owned());
                 let start = self.playback.play(queue, index, Some(folia_core::Origin { name })).map(Message::Playback);
@@ -1478,6 +2475,9 @@ impl Shell {
                 self.playback.update(playback::Message::Toggle, &self.store).map(Message::Playback)
             }
             Some(library::Effect::EnterPlayer) => {
+                if self.page != Page::NowPlaying {
+                    self.remember_page();
+                }
                 self.page = Page::NowPlaying;
                 self.reveal_chrome();
                 Task::none()
@@ -1523,10 +2523,6 @@ impl Shell {
         }
         self.drag_armed = false;
         self.drag_from = None;
-        if !chrome::button_down() {
-            tracing::debug!("window drag dropped: the button was already up");
-            return Task::none();
-        }
         iced::window::drag(id)
     }
 
@@ -1550,7 +2546,36 @@ impl Shell {
         iced::window::set_mode(id, mode)
     }
 
+    fn request_close(&mut self) -> Task<Message> {
+        if self.storage.defer_close() {
+            return Task::none();
+        }
+        if self.closing {
+            return Task::none();
+        }
+        let task = self.playback_session.close(&self.playback, &self.store);
+        self.closing = true;
+        self.scene_generation = self.scene_generation.wrapping_add(1);
+        self.playback.shutdown();
+        task
+    }
+
+    fn storage_message(&mut self, message: storage::Message) -> Task<Message> {
+        #[cfg(target_os = "linux")]
+        let before = self.storage.active.clone();
+        let task =
+            self.storage.update(message, &self.store, self.omni.clone(), &mut self.playback, &mut self.scene_sound);
+        #[cfg(target_os = "linux")]
+        if before != self.storage.active {
+            self.media_session = media_session::Bridge::new(self.storage.active.clone());
+        }
+        if self.storage.take_close() { Task::batch([task, self.request_close()]) } else { task }
+    }
+
     fn chrome(&mut self, message: chrome::Message) -> Task<Message> {
+        if matches!(message, chrome::Message::Close) {
+            return self.request_close();
+        }
         let Some(id) = self.window else {
             return iced::window::oldest().map(Message::WindowReady);
         };
@@ -1567,7 +2592,7 @@ impl Shell {
             let _ = self.panel(panel::Message::QualitySelect(quality_select::Message::Close));
         }
         match message {
-            chrome::Message::Drag if !self.fullscreen && chrome::button_down() => iced::window::drag(id),
+            chrome::Message::Drag if !self.fullscreen => iced::window::drag(id),
             chrome::Message::Drag => Task::none(),
             chrome::Message::DragArm => {
                 if self.fullscreen {
@@ -1576,18 +2601,15 @@ impl Shell {
                 // The press is on the strip; the subscription's `PointerHeld(true)` may come after the first move.
                 self.pointer_held = true;
                 self.drag_armed = true;
-                self.drag_from = None;
+                self.drag_from = self.clock.pointer;
                 Task::none()
             }
-            chrome::Message::DragMove { x, y } => self.drag_move(id, x, y),
             chrome::Message::DragEnd => {
                 self.drag_armed = false;
                 self.drag_from = None;
                 Task::none()
             }
-            chrome::Message::Resize(direction) if !self.fullscreen && chrome::button_down() => {
-                iced::window::drag_resize(id, direction)
-            }
+            chrome::Message::Resize(direction) if !self.fullscreen => iced::window::drag_resize(id, direction),
             chrome::Message::Resize(_) => Task::none(),
             chrome::Message::Minimize => iced::window::minimize(id, true),
             chrome::Message::ToggleMaximize => {
@@ -1598,7 +2620,7 @@ impl Shell {
                 iced::window::toggle_maximize(id)
             }
             chrome::Message::ToggleFullscreen => self.toggle_fullscreen(),
-            chrome::Message::Close => iced::window::close(id),
+            chrome::Message::Close => self.request_close(),
             chrome::Message::Activity { x, y } => {
                 self.clock = self.clock.pointer(self.now_ms(), x, y);
                 let height = self.window_size.height;
@@ -1632,12 +2654,150 @@ impl Shell {
         }
     }
 
+    fn wall_backdrop_visible(&self) -> bool {
+        self.page == Page::Library
+            && (self.appearance.wall.look != folia_store::WallLook::Solid
+                || self.appearance.wall.seam_clear && self.library.seam().width > 0.0 && !self.library.poster_tilted())
+    }
+
+    fn song_surface(&self, wall: bool) -> Element<'_, Message> {
+        let muted = folia_visualizer::color(self.theme.secondary, 1.0);
+        let daylight = self.appearance.theme == ThemeMode::Light;
+        let (title, artist, album, track_id) = match self.playback.current() {
+            Some(track) => (
+                track.title.clone(),
+                track.artist.clone().unwrap_or_default(),
+                track.album.clone().unwrap_or_default(),
+                Some(track.id),
+            ),
+            None => (String::new(), String::new(), String::new(), None),
+        };
+        let portrait = self.portrait_handle(track_id).cloned();
+        let tuning = self.tuning_of(self.style());
+        let lyrics = if wall && !self.appearance.wall.backdrop_lyrics {
+            &self.empty_lyrics
+        } else {
+            self.playback.lyrics.as_ref().unwrap_or(&self.empty_lyrics)
+        };
+        let scene = Scene {
+            smart_beat: self.smart_beat.frame(self.playback.heard_position()),
+            render_quality: tuning.render_quality(self.graphics.lyric_render_quality),
+            static_mode: self.graphics.static_mode,
+            paused: !self.playback.is_playing(),
+            daylight,
+            style: self.style(),
+            lyrics,
+            time: self.visualizer_hold.unwrap_or_else(|| self.playback.lyric_time()),
+            theme: &self.theme,
+            font_scale: self.appearance.lyrics_font_scale,
+            seed: self.visualizer_seed.as_str(),
+            stage: None,
+            tuning,
+            backdrop: true,
+            title,
+            artist,
+            album,
+            portrait,
+            typography: fonts::typography(&self.appearance),
+            preview: false,
+            audio: &self.audio,
+        };
+        let subtitle = self.subtitle();
+        let bottom = subtitle_bottom(self.bar_offset(), self.subtitle_presence.value(self.now_ms()));
+        let background = folia_visualizer::color(self.theme.background, 1.0);
+        let vignette = if self.appearance.disable_visualizer_vignette { 0.0 } else { 0.28 };
+        let now = std::time::Instant::now();
+        let foot = now_playing::Foot {
+            bottom,
+            glass: self.bar.shown(now) > 0.0
+                || self.panel.glass(now) > 0.0
+                || self.panel.handle_amount(now) > 0.0
+                || self.back_hotspot()
+                || self.notice_visible(now),
+        };
+        let surface = if self.scene_active() {
+            now_playing::Surface::Cinema {
+                config: folia_visualizer::cinema::Config {
+                    generation: self.scene_generation,
+                    options: &self.scene.scene_options.cinema,
+                    render_quality: scene.render_quality,
+                    theme: &self.theme,
+                    audio: &self.audio,
+                    song_id: track_id,
+                    cover: self
+                        .background_cover
+                        .as_ref()
+                        .filter(|(id, _)| Some(*id) == track_id)
+                        .map(|(_, image)| image),
+                    cover_pending: self.art_pending.is_some_and(|(id, _)| Some(id) == track_id),
+                    paused: !self.playback.is_playing(),
+                    static_mode: self.graphics.static_mode,
+                    reduced_motion: motion::reduced(folia_store::MotionSurface::UiMicroMotion),
+                    active: self.visualizer_hold.is_none(),
+                    queue_ended: self.playback.queue_ended(),
+                    publish_blur: true,
+                },
+                scene,
+            }
+        } else {
+            scene.into()
+        };
+        let screen = now_playing::Screen {
+            transparent: self.player_transparent(),
+            window: self.window_size,
+            vignette,
+            subtitle_opacity: self.appearance.subtitle.opacity,
+            subtitle_background: self.appearance.subtitle.background,
+            subtitle_blur: self.appearance.subtitle.upcoming_blur,
+            harmony: &self.appearance.subtitle,
+            dpi: self.window_scale,
+            opacity: self.appearance.visualizer_opacity,
+            subtitle_scale: self.appearance.subtitle.font_scale,
+            subtitle_font: fonts::resolve(if self.appearance.subtitle.font_inherits_lyrics {
+                &self.appearance.lyrics_font
+            } else {
+                &self.appearance.subtitle.font
+            }),
+            shared: now_playing::Backdrop {
+                static_mode: self.graphics.static_mode,
+                mode: folia_visualizer::Background::resolve(self.appearance.stored_background_mode()),
+                shapes: !self.appearance.disable_visualizer_geometric_background,
+                vignette: !self.appearance.disable_visualizer_vignette,
+                paused: !self.playback.is_playing() || self.visualizer_hold.is_some(),
+            },
+            cover: self.playback.current().and_then(|track| self.cover_palettes.get(track.id)).unwrap_or(&[]),
+            cover_overlay: self.appearance.use_cover_color_bg.then_some(self.appearance.cover_background_opacity),
+            latent: folia_visualizer::LatentTuning::read(self.visualizer.tables.get("latent_background_tuning")),
+            daylight,
+            sora: folia_visualizer::SoraTuning::read(self.visualizer.tables.get("sora_background_tuning")),
+            monet: self.monet_background_tuning(),
+            picture: self.background_poster.image(),
+            nomand: folia_visualizer::nomand::Tuning::read(self.visualizer.tables.get("nomand_background_tuning")),
+        };
+        if wall {
+            now_playing::wall(surface, screen, self.appearance.wall)
+        } else {
+            now_playing::projected(surface, &self.i18n, muted, background, screen, subtitle, foot)
+        }
+    }
+
     pub fn view(&self) -> Element<'_, Message> {
+        motion::configure(&self.graphics.motion, self.system_reduced_motion);
         let (text_color, muted) =
             (folia_visualizer::color(self.theme.primary, 1.0), folia_visualizer::color(self.theme.secondary, 1.0));
         let daylight = self.appearance.theme == ThemeMode::Light;
         let page: Element<'_, Message> = match self.page {
-            Page::Library | Page::Search => {
+            Page::Lattice => {
+                let generation = self.lattice_generation;
+                self.lattice.as_ref().map_or_else(
+                    || iced::widget::space().into(),
+                    |page| {
+                        page.view(&self.i18n, &self.theme, &self.appearance, &self.playback, self.window_size)
+                            .map(move |message| Message::Lattice(generation, message))
+                    },
+                )
+            }
+            Page::Library | Page::Search | Page::Catalog => {
                 let playing = self.playback.current().map(|track| track.id);
                 let queued = self
                     .library
@@ -1656,104 +2816,50 @@ impl Shell {
                         || self.timeline.is_open(),
                     modal: self.modal_open(),
                 };
-                self.library.view(&self.i18n, &self.theme, daylight, muted, playing, look).map(Message::Library)
-            }
-            Page::NowPlaying => {
-                let (title, artist, album, track_id) = match self.playback.current() {
-                    Some(track) => (
-                        track.title.clone(),
-                        track.artist.clone().unwrap_or_default(),
-                        track.album.clone().unwrap_or_default(),
-                        Some(track.id),
-                    ),
-                    None => (String::new(), String::new(), String::new(), None),
+                let wall =
+                    self.library.view(&self.i18n, &self.theme, daylight, muted, playing, look).map(Message::Library);
+                let backdrop = self.wall_backdrop_visible();
+                let background = if backdrop {
+                    self.song_surface(true)
+                } else {
+                    space().width(Length::Fill).height(Length::Fill).into()
                 };
-                let portrait = self.portrait_handle(track_id).cloned();
-                let tuning = self.tuning_of(self.style());
-                let lyrics = self.playback.lyrics.as_ref().unwrap_or(&self.empty_lyrics);
-                let scene = Scene {
-                    style: self.style(),
-                    lyrics,
-                    time: self.playback.lyric_time(),
-                    theme: &self.theme,
-                    font_scale: self.appearance.lyrics_font_scale,
-                    seed: self.visualizer_seed.as_str(),
-                    stage: None,
-                    tuning,
-                    backdrop: true,
-                    title,
-                    artist,
-                    album,
-                    portrait,
-                    typography: fonts::typography(&self.appearance),
-                    preview: false,
-                    audio: &self.audio,
-                };
-                let subtitle = self.subtitle();
-                let bottom = subtitle_bottom(self.bar_offset(), self.subtitle_presence.value(self.now_ms()));
-                let background = folia_visualizer::color(self.theme.background, 1.0);
-                let vignette = if self.appearance.disable_visualizer_vignette { 0.0 } else { 0.28 };
-                let now = std::time::Instant::now();
-                let foot = now_playing::Foot {
-                    bottom,
-                    glass: self.bar.shown(now) > 0.0
-                        || self.panel.glass(now) > 0.0
-                        || self.panel.handle_amount(now) > 0.0
-                        || self.back_hotspot()
-                        || self.notice_visible(now),
-                };
-                now_playing::view(
-                    scene,
-                    &self.i18n,
-                    muted,
-                    background,
-                    now_playing::Screen {
-                        window: self.window_size,
-                        vignette,
-                        subtitle_opacity: self.appearance.subtitle.opacity,
-                        subtitle_background: self.appearance.subtitle.background,
-                        subtitle_blur: self.appearance.subtitle.upcoming_blur,
-                        dpi: self.window_scale,
-                        opacity: self.appearance.visualizer_opacity,
-                        subtitle_scale: self.appearance.subtitle.font_scale,
-                        subtitle_font: fonts::resolve(if self.appearance.subtitle.font_inherits_lyrics {
-                            &self.appearance.lyrics_font
-                        } else {
-                            &self.appearance.subtitle.font
-                        }),
-                        shared: now_playing::Backdrop {
-                            mode: folia_visualizer::Background::resolve(self.appearance.stored_background_mode()),
-                            shapes: !self.appearance.disable_visualizer_geometric_background,
-                            vignette: !self.appearance.disable_visualizer_vignette,
-                            paused: !self.playback.is_playing(),
-                        },
-                        cover: self
-                            .playback
-                            .current()
-                            .and_then(|track| self.cover_palettes.get(track.id))
-                            .unwrap_or(&[]),
-                        latent: folia_visualizer::LatentTuning::read(
-                            self.visualizer.tables.get("latent_background_tuning"),
-                        ),
-                        daylight,
-                        sora: folia_visualizer::SoraTuning::read(self.visualizer.tables.get("sora_background_tuning")),
-                        monet: folia_visualizer::monet_background::Tuning::read(
-                            self.visualizer.tables.get("monet_background_tuning"),
-                        ),
-                        picture: self.background_poster.image(),
-                        nomand: folia_visualizer::nomand::Tuning::read(
-                            self.visualizer.tables.get("nomand_background_tuning"),
-                        ),
-                    },
-                    subtitle,
-                    foot,
+                // Keep the wall in the same child slot when panning moves the transparent seam offscreen.
+                let surface = stack![background, wall].into();
+                let capture =
+                    (backdrop && self.home.tools(now) > 0.0).then_some(folia_render::quality::WallLayer::GlassSource);
+                folia_render::quality::wall_layer(
+                    surface,
+                    capture,
+                    Some(Box::new(move |images| {
+                        self.library.wall_images(playing, images);
+                    })),
                 )
             }
+            Page::NowPlaying => self.song_surface(false),
         };
         let playing = self.page == Page::NowPlaying;
         let now = std::time::Instant::now();
         let mut frame: iced::widget::Stack<'_, Message, iced::Theme, iced::Renderer> = if playing {
             stack![page]
+        } else if self.page == Page::Catalog {
+            match &self.catalog {
+                Some(catalog) => stack![
+                    catalog
+                        .view(catalog::View {
+                            i18n: &self.i18n,
+                            ink: text_color,
+                            muted,
+                            accent: folia_visualizer::color(self.theme.accent, 1.0),
+                            background: folia_visualizer::color(self.theme.background, 1.0),
+                            daylight,
+                            width: self.window_size.width,
+                            height: self.window_size.height
+                        })
+                        .map(Message::Catalog)
+                ],
+                None => stack![page],
+            }
         } else if self.page == Page::Search {
             let provider = self.library.online.provider();
             let search_source = self
@@ -1773,6 +2879,7 @@ impl Shell {
                         daylight,
                         width: self.window_size.width,
                         source: search_source,
+                        catalog: self.omni.as_ref().map(|omni| omni.capabilities(provider)).unwrap_or_default(),
                     },
                     now,
                 )
@@ -1790,8 +2897,9 @@ impl Shell {
         };
         if playing && self.back_hotspot() {
             // `VisualizerShell` back: `backdrop-blur-md` (12px) under `bg-black/20`.
+            let backdrop = if self.player_transparent() { 0.0 } else { 12.0 };
             let back = iced::widget::stack![
-                chrome::glass_disc(40.0, [0.0; 4], 12.0, 1.0),
+                chrome::glass_disc(40.0, [0.0; 4], backdrop, 1.0),
                 chrome::round_button(
                     Icon::ChevronLeft,
                     20.0,
@@ -1799,7 +2907,7 @@ impl Shell {
                     Color { a: 0.2, ..Color::BLACK },
                     Color { r: 1.0, g: 1.0, b: 1.0, a: 0.6 },
                     self.i18n.t("ui.back"),
-                    Message::Navigate(Page::Library),
+                    Message::Back,
                 )
             ]
             .into();
@@ -1811,13 +2919,14 @@ impl Shell {
             ));
         }
         // The original mounts the bar on home too, collapsed until hovered (`buildAppOverlaysModel.ts:255`).
-        if (playing || self.page == Page::Library) && self.playback.current().is_some() {
+        if (playing || matches!(self.page, Page::Library | Page::Lattice)) && self.playback.current().is_some() {
             let look = player_bar::Look {
                 i18n: &self.i18n,
                 primary: text_color,
                 secondary: muted,
                 background: folia_visualizer::color(self.theme.background, 1.0),
                 daylight,
+                transparent_background: self.player_transparent(),
                 window: self.window_size,
                 bottom: self.bar_offset(),
                 modal: self.modal_open(),
@@ -1857,6 +2966,12 @@ impl Shell {
             let add_reason = self.panel_add_reason.as_deref();
             let can_match = self.omni.is_some() && self.playback.current().is_some_and(|track| track.online.is_some());
             let panel_view = panel::View {
+                catalog: self
+                    .playback
+                    .current()
+                    .and_then(|track| track.online.as_ref())
+                    .and_then(|id| self.omni.as_ref().map(|omni| omni.capabilities(&id.provider)))
+                    .unwrap_or_default(),
                 i18n: &self.i18n,
                 theme: &self.theme,
                 daylight,
@@ -1866,11 +2981,12 @@ impl Shell {
                 queue: self.playback.queue.items(),
                 index: self.playback.queue.current_index(),
                 volume: self.playback.settings.volume,
-                muted: self.playback.muted,
+                muted: self.playback.settings.muted,
                 lyric_offset: self.playback.lyric_offset,
                 bottom: self.bar_offset(),
                 repeat: self.playback.settings.repeat,
                 style_id: &self.appearance.visualizer,
+                scene: self.scene.scene_id,
                 has_lyrics: self.playback.lyrics.as_ref().is_some_and(|lyrics| !lyrics.lines.is_empty()),
                 font_scale: self.appearance.lyrics_font_scale,
                 drawn_style: style,
@@ -1879,6 +2995,7 @@ impl Shell {
                 pill_hover: self.panel.pill_hover(),
                 platform,
                 account,
+                account_controls: !self.sources.custom_only(),
                 account_avatar: self.library.online.avatar_for(provider),
                 syncing: self.library.online.syncing(provider),
                 quality_levels,
@@ -1891,18 +3008,14 @@ impl Shell {
                 add_disabled: add_reason,
                 quick,
                 theme_source: self.theme_settings.source,
+                transparent_background: self.theme_settings.transparent_player_background,
+                transparent_surface: self.player_transparent(),
                 has_custom_theme: self.theme_settings.custom_dual_theme.is_some(),
+                can_generate_theme: self.song_themes.can_generate(&self.playback),
+                generating_theme: self.song_themes.generating,
                 random_pool: self.theme_settings.random_pool.as_deref(),
                 all_styles: &Style::ALL,
                 background: folia_visualizer::Background::resolve(self.appearance.stored_background_mode()),
-                sora: folia_visualizer::SoraTuning::read(self.visualizer.tables.get("sora_background_tuning")),
-                monet: folia_visualizer::monet_background::Tuning::read(
-                    self.visualizer.tables.get("monet_background_tuning"),
-                ),
-                picture: self.background_poster.image(),
-                nomand: folia_visualizer::nomand::Tuning::read(self.visualizer.tables.get("nomand_background_tuning")),
-                background_shapes: !self.appearance.disable_visualizer_geometric_background,
-                background_vignette: !self.appearance.disable_visualizer_vignette,
                 equalizer_on: self.audio_settings.equalizer.enabled,
                 replay_gain: self.audio_settings.replay_gain_mode,
                 gain: self.playback_gain(),
@@ -1918,8 +3031,7 @@ impl Shell {
                     })
                     .map_or("", |platform| platform.short_name),
                 can_shuffle: !self.playback.is_fm() && self.playback.queue.items().len() >= 2,
-                can_save_queue: !self.playback.queue.items().is_empty()
-                    && self.playback.queue.items().iter().all(|track| track.online.is_none() && track.id > 0),
+                can_save_queue: self.playback.can_save_queue(),
             };
             frame = frame.push(self.panel.view(panel_view, std::time::Instant::now()).map(Message::Panel));
         }
@@ -1938,45 +3050,23 @@ impl Shell {
         }) {
             frame = frame.push(dialog.map(Message::Playlists));
         }
-        if let Some(window) = &self.workbench {
-            let style = self.style();
-            let live = self
-                .playback
-                .lyrics
-                .as_ref()
-                .filter(|lyrics| !lyrics.lines.is_empty())
-                .map(|lyrics| (lyrics, self.playback.lyric_time()));
-            frame = frame.push(window.view(workbench::Look {
-                i18n: &self.i18n,
-                theme: &self.theme,
-                daylight,
-                window: self.window_size,
-                style,
-                font_scale: self.appearance.lyrics_font_scale,
-                live,
-                audio: &self.audio,
-                appearance: &self.appearance,
-                fonts: &self.system_fonts,
-                dpi: self.window_scale,
-                latent: folia_visualizer::LatentTuning::read(self.visualizer.tables.get("latent_background_tuning")),
-                sora: folia_visualizer::SoraTuning::read(self.visualizer.tables.get("sora_background_tuning")),
-                monet: folia_visualizer::monet_background::Tuning::read(
-                    self.visualizer.tables.get("monet_background_tuning"),
-                ),
-                picture: self.background_poster.image(),
-                nomand: folia_visualizer::nomand::Tuning::read(self.visualizer.tables.get("nomand_background_tuning")),
-                cover: self.playback.current().and_then(|track| self.cover_palettes.get(track.id)).unwrap_or(&[]),
-                has_background_upload: self.background_upload.is_some(),
-            }));
-        }
         if let Some(window) = &self.settings {
             let values = settings::Values {
+                storage: &self.storage,
+                scrobble_enabled: self.playback.settings.netease_scrobble_enabled,
+                scrobble_ready: self.omni.as_ref().is_some_and(|omni| omni.playback_reporting_ready("netease")),
                 sources: &self.sources,
                 unlock: &self.unlock,
                 language: self.general.language,
                 resolved: self.i18n.language(),
                 appearance: &self.appearance,
+                theme_settings: &self.theme_settings,
+                graphics: &self.graphics,
+                applied_gpu: self.applied_gpu,
+                system_reduced_motion: self.system_reduced_motion,
+                song_themes: &self.song_themes,
                 style: self.chosen_style(),
+                scene: self.scene.scene_id,
                 bar_offset: self.player.bottom_bar_offset,
                 bar_max: folia_store::bottom_bar_max_offset(self.window_size.height),
                 has_track: self.playback.current().is_some(),
@@ -1986,6 +3076,30 @@ impl Shell {
                 memory_log_path: self.memory_monitor.log_path(),
             };
             frame = frame.push(window.view(&self.i18n, &self.theme, daylight, self.window_size, values));
+        }
+        if let Some(window) = &self.workbench {
+            frame = frame.push(window.view(self.workbench_look()));
+        }
+        if let Some(park) = &self.theme_park {
+            frame = frame.push(park.view(self.workbench_look(), &self.theme, daylight));
+        }
+        if let Some(window) = &self.scene_window {
+            frame = frame.push(
+                window
+                    .view(
+                        &self.scene,
+                        scene_settings::Look {
+                            i18n: &self.i18n,
+                            theme: &self.theme,
+                            daylight,
+                            window: self.window_size,
+                            sound_available: self.scene_sound.available,
+                            sound_loading: self.scene_sound.loading,
+                            sound_error: self.scene_sound.error.as_deref(),
+                        },
+                    )
+                    .map(Message::SceneSettings),
+            );
         }
         let look = login::Look {
             i18n: &self.i18n,
@@ -2005,7 +3119,9 @@ impl Shell {
                 .avatar_for(self.login.chosen_provider().unwrap_or(self.library.online.provider())),
             has_track: !self.playback.queue.items().is_empty(),
         };
-        if let Some(window) = self.login.view(look, now) {
+        if !self.sources.custom_only()
+            && let Some(window) = self.login.view(look, now)
+        {
             frame = frame.push(window.map(Message::Login));
         }
         if let Some(layer) =
@@ -2039,6 +3155,15 @@ impl Shell {
                 opacity,
                 shift,
                 self.playback.loading_angle(now),
+            ));
+        }
+        if let Some((opacity, shift)) = self.playback.custom_source_notice(now) {
+            frame = frame.push(status_toast::custom_source_view(
+                &self.i18n,
+                daylight,
+                self.window_size.width,
+                opacity,
+                shift,
             ));
         }
         if let Some((provider, opacity, shift)) = self.playback.subscription_notice(now)
@@ -2086,6 +3211,9 @@ impl Shell {
         ) {
             frame = frame.push(layer);
         }
+        if self.storage.moving {
+            frame = frame.push(self.storage.overlay(&self.i18n, settings_kit::Tokens::new(&self.theme, daylight)));
+        }
         // `z-[9999]`: the title bar sits above every page and dialog.
         let look = chrome::TitlebarLook {
             i18n: &self.i18n,
@@ -2132,9 +3260,16 @@ impl Shell {
 
     /// Settings, the lyric workbench, the sign-in window or the lyrics timeline.
     fn modal_open(&self) -> bool {
+        if self.storage.moving {
+            return true;
+        }
+        if self.theme_park.is_some() {
+            return true;
+        }
         self.sources.has_alert()
             || self.settings.is_some()
             || self.workbench.is_some()
+            || self.scene_window.is_some()
             || self.login.is_open()
             || self.sheets.any_open()
             || self.add_to_playlist.is_open()
@@ -2143,7 +3278,7 @@ impl Shell {
 
     /// Surfaces that take the keyboard the way an open sheet does: settings, sign-in, the workbench, search.
     fn blocks_space(&self) -> bool {
-        self.modal_open() || self.page == Page::Search
+        self.modal_open() || matches!(self.page, Page::Search | Page::Catalog)
     }
 
     /// The original back button only appears inside the top-left 120px square.
@@ -2165,6 +3300,7 @@ impl Shell {
     /// A status toast is on screen, so the page under it has to feed the blur.
     fn notice_visible(&self, now: std::time::Instant) -> bool {
         self.playback.subscription_notice(now).is_some_and(|(_, opacity, _)| opacity > 0.0)
+            || self.playback.custom_source_notice(now).is_some_and(|(opacity, _)| opacity > 0.0)
             || self.playback.loading_notice(now).is_some_and(|(opacity, _)| opacity > 0.0)
             || self.library.online.sync_notice(now).is_some_and(|(_, _, _, opacity, _)| opacity > 0.0)
     }
@@ -2176,12 +3312,17 @@ impl Shell {
         let Some(lyrics) = self.playback.lyrics.as_ref() else {
             return overlay::SubtitleRows::default();
         };
-        overlay::subtitle_rows_at(&lyrics.lines, self.playback.lyric_time(), &self.appearance.subtitle)
+        overlay::subtitle_rows_at(
+            &lyrics.lines,
+            self.visualizer_hold.unwrap_or_else(|| self.playback.lyric_time()),
+            &self.appearance.subtitle,
+        )
     }
 
     /// Ticks only while music plays: every frame on the visualizer page, a few times a second elsewhere.
     pub fn subscription(&self) -> Subscription<Message> {
         let mut parts = vec![
+            iced::system::theme_changes().map(Message::SystemTheme),
             iced::window::resize_events().map(|(_id, size)| Message::WindowResized(size)),
             iced::event::listen_with(fullscreen_key),
             iced::event::listen_with(window_pointer),
@@ -2189,6 +3330,25 @@ impl Shell {
             iced::event::listen_with(chrome_pointer),
             iced::event::listen_with(developer_key),
         ];
+        #[cfg(target_os = "linux")]
+        if !self.closing {
+            parts.push(self.media_session.subscription());
+        }
+        if self.graphics.motion.follow_system {
+            parts.push(
+                iced::time::every(std::time::Duration::from_secs(3))
+                    .map(|_| Message::Graphics(graphics::Message::Poll)),
+            );
+        }
+        if self.graphics.background_throttling && folia_render::backend::window_hidden() {
+            if self.playback.is_playing() {
+                parts.push(
+                    iced::time::every(std::time::Duration::from_millis(250))
+                        .map(|_| Message::Playback(playback::Message::Tick)),
+                );
+            }
+            return Subscription::batch(parts);
+        }
         if self.sources.polls() {
             parts.push(
                 iced::time::every(std::time::Duration::from_secs(1)).map(|_| Message::Sources(sources::Message::Poll)),
@@ -2213,14 +3373,20 @@ impl Shell {
             );
         }
         if self.playback.current().is_some() && !self.blocks_space() {
-            parts.push(iced::event::listen_with(space_key));
+            parts.push(iced::event::listen_with(if self.page == Page::Lattice {
+                lattice_space_key
+            } else {
+                space_key
+            }));
         }
         if self.page == Page::NowPlaying && self.clock.until_ms.is_some() {
             parts.push(iced::time::every(std::time::Duration::from_millis(200)).map(|_| Message::ChromeTick));
         }
         let player_keys = self.page == Page::NowPlaying
+            && self.theme_park.is_none()
             && self.settings.is_none()
             && self.workbench.is_none()
+            && self.scene_window.is_none()
             && !self.login.is_open()
             && !self.timeline.is_open()
             && self.positioning.is_none();
@@ -2228,25 +3394,38 @@ impl Shell {
             parts.push(iced::event::listen_with(player_key));
             parts.push(iced::event::listen_with(player_ime));
         }
-        if let Some(window) = &self.settings {
+        if self.settings.is_some()
+            && self.workbench.is_none()
+            && self.theme_park.is_none()
+            && self.scene_window.is_none()
+        {
             parts.push(iced::event::listen_with(settings_key));
-            if window.animating() {
-                parts.push(iced::window::frames().map(|_| Message::Settings(settings::Message::Frame)));
-            }
         }
-        if let Some(window) = &self.workbench {
+        if self.workbench.is_some() {
             parts.push(iced::event::listen_with(workbench_key));
-            if window.ticking() {
-                parts.push(iced::window::frames().map(|_| Message::Workbench(workbench::Message::Frame)));
-            }
+        }
+        if self.theme_park.is_some() {
+            parts.push(iced::event::listen_with(theme_park_key));
+        }
+        if self.scene_window.is_some() {
+            parts.push(iced::event::listen_with(scene_settings_key));
         }
         if self.positioning.is_some() {
             parts.push(iced::event::listen_with(positioner_key));
         }
-        let sheets = self.settings.is_none() && self.workbench.is_none() && !self.login.is_open();
+        let sheets =
+            self.settings.is_none() && self.workbench.is_none() && self.theme_park.is_none() && !self.login.is_open();
         // The tools panel leaves the wall its keys; only its Escape is the panel's (`WallToolsSurface`).
         let beside_tools = self.home.tools_open() && !self.home.more_open() && !self.library.menu_open();
-        if self.page == Page::Library && sheets && (!self.home_menu_open() || beside_tools) {
+        if self.page == Page::Lattice && sheets && !self.home.more_open() && !self.home.queue_editing() {
+            parts.push(iced::event::listen_with(if beside_tools { wall_key_beside_tools } else { wall_key }));
+        }
+        if self.page == Page::Library
+            && sheets
+            && self.home.command_query().is_none()
+            && !self.home.queue_editing()
+            && (!self.home_menu_open() || beside_tools)
+        {
             if self.home.search_query().is_some() {
                 parts.push(iced::event::listen_with(seam_search_key));
                 parts.push(iced::event::listen_with(seam_search_ime));
@@ -2264,88 +3443,66 @@ impl Shell {
         if self.login.is_open() {
             parts.push(iced::event::listen_with(login_key));
         }
-        if self.login.animating(std::time::Instant::now()) {
-            parts.push(iced::window::frames().map(|_| Message::Login(login::Message::Frame)));
-        }
         if self.timeline.is_open() {
             parts.push(iced::event::listen_with(timeline_key));
-            if self.timeline.animating(std::time::Instant::now()) {
-                parts.push(iced::window::frames().map(|_| Message::Timeline(timeline::Message::Frame)));
-            }
-        }
-        if self.splash.showing(std::time::Instant::now()) {
-            parts.push(iced::window::frames().map(|_| Message::SplashFrame));
         }
         let now = std::time::Instant::now();
-        if self.playback.notice_animating(now) {
-            parts.push(iced::window::frames().map(|_| Message::Playback(playback::Message::NoticeFrame)));
-        }
         let loading_motion = self.playback.loading.active()
             || (self.playback.is_playing() && self.playback.is_buffering())
             || self.playback.loading_notice(now).is_some();
-        if loading_motion {
-            parts.push(
-                iced::time::every(std::time::Duration::from_secs_f64(1.0 / 60.0))
-                    .map(|_| Message::Playback(playback::Message::Tick)),
-            );
-        }
-        if self.library.online.sync_notice_animating(now) {
-            parts.push(
-                iced::window::frames().map(|_| Message::Library(library::Message::Online(online::Message::SyncFrame))),
-            );
-        }
-        if self.page != Page::Search && (self.bar.animating(now) || self.subtitle_presence.running(self.now_ms())) {
-            parts.push(iced::window::frames().map(|_| Message::Bar(player_bar::Message::Frame)));
-        }
-        if self.page_fade.as_ref().is_some_and(|fade| fade.running(now)) {
-            parts.push(iced::window::frames().map(|_| Message::Chrome(chrome::Message::Frame)));
-        }
-        if self.titlebar.animating(now) {
-            parts.push(iced::window::frames().map(|_| Message::Chrome(chrome::Message::Frame)));
-        }
-        if self.page == Page::Library
-            && (self.home.animating(now)
-                || self.library.coasting()
-                || self.library.hint_busy(now)
-                || self.seam_flip.is_some())
-        {
-            parts.push(iced::window::frames().map(|_| Message::Library(library::Message::Frame)));
-        }
-        if self.page == Page::Library && self.home.scrolling(now) {
-            parts.push(iced::window::frames().map(|_| Message::Home(home::Message::Frame)));
-        }
-        if self.page == Page::NowPlaying && self.panel.animating(now) {
-            parts.push(iced::window::frames().map(|_| Message::Panel(panel::Message::Frame)));
-        }
-        if self.status.is_some() {
-            parts.push(iced::window::frames().map(|_| Message::StatusFrame));
-        }
-        if self.page == Page::Library && self.home_menu_open() {
+        let lattice_motion = self.page == Page::Lattice
+            && self.lattice.as_ref().is_some_and(|page| {
+                page.animating(now) || self.playback.is_playing() && page.lyrics_visible(&self.playback)
+            });
+        if matches!(self.page, Page::Library | Page::Lattice) && self.home_menu_open() {
             parts.push(iced::event::listen_with(home_dismiss));
         }
-        if self.page == Page::Search {
-            if self.settings.is_none() {
-                parts.push(iced::event::listen_with(search_key));
-            }
-            if self.search.animating(now) || self.search.spinning() {
-                parts.push(iced::window::frames().map(|_| Message::Search(search::Message::Frame)));
-            }
+        if self.page == Page::Catalog && sheets {
+            parts.push(iced::event::listen_with(catalog_key));
         }
-        if self.playback.is_playing() && !loading_motion {
-            let tick = |_| Message::Playback(playback::Message::Tick);
-            let playback = if self.page != Page::NowPlaying {
-                iced::time::every(std::time::Duration::from_millis(250)).map(tick)
+        if self.page == Page::Search && self.settings.is_none() {
+            parts.push(iced::event::listen_with(search_key));
+        }
+        let preview = self
+            .workbench
+            .as_ref()
+            .is_some_and(|window| window.ticking() || (window.live_running() && self.playback.is_playing()))
+            || self.theme_park.as_ref().is_some_and(|park| {
+                park.preview.ticking() || (park.preview.live_running() && self.playback.is_playing())
+            });
+        let ui_motion = self.ui_frames(now).active();
+        let visual = self.scene_active()
+            || lattice_motion
+            || preview
+            || loading_motion
+            || (self.wall_backdrop_visible() && self.playback.is_playing())
+            || (self.page == Page::NowPlaying && (self.playback.is_playing() || self.panel.visualizing()));
+        if visual || ui_motion {
+            let cap = if ui_motion
+                || self.scene_active()
+                || preview
+                || self.panel.visualizing()
+                || loading_motion
+                || lattice_motion
+            {
+                None
             } else {
-                let fps = match (self.appearance.frame_rate.fps(), self.style().max_fps()) {
-                    (Some(setting), Some(cap)) => Some(setting.min(cap)),
-                    (setting, cap) => setting.or(cap),
-                };
-                match fps {
-                    Some(fps) => iced::time::every(std::time::Duration::from_secs_f64(1.0 / f64::from(fps))).map(tick),
-                    None => iced::window::frames().map(tick),
-                }
+                self.style().max_fps()
             };
-            parts.push(playback);
+            let fps = match (self.appearance.frame_rate.fps(), cap) {
+                (Some(setting), Some(cap)) => Some(setting.min(cap)),
+                (setting, cap) => setting.or(cap),
+            };
+            let frames = match fps {
+                Some(fps) => folia_render::frames_at(fps),
+                None => iced::window::frames(),
+            };
+            parts.push(if visual { frames.map(|_| Message::VisualFrame) } else { frames.map(|_| Message::UiFrame) });
+        } else if self.playback.is_playing() {
+            parts.push(
+                iced::time::every(std::time::Duration::from_millis(250))
+                    .map(|_| Message::Playback(playback::Message::Tick)),
+            );
         }
         Subscription::batch(parts)
     }
@@ -2557,6 +3714,7 @@ impl Shell {
             | workbench::Effect::Appearance => {}
             workbench::Effect::Close => self.workbench = None,
             workbench::Effect::Draft => self.hold_tuning(style, values.clone()),
+            workbench::Effect::SmartBeat(change) => self.smart_beat.change(change, &mut self.visualizer),
             workbench::Effect::ScrollTop => tasks.push(self.snap_settings()),
             workbench::Effect::Style(next) => {
                 self.appearance.visualizer = next.id().to_owned();
@@ -2676,6 +3834,13 @@ impl Shell {
             None => self.home.search_query(),
         };
         let mut host = home::Host {
+            scrobble_enabled: self.playback.settings.netease_scrobble_enabled,
+            scrobble_ready: self.omni.as_ref().is_some_and(|omni| omni.playback_reporting_ready("netease")),
+            wall: self.appearance.wall,
+            lattice: self.page == Page::Lattice,
+            can_save: self.home.island_shown(now) && self.playback.can_save_queue(),
+            can_generate: self.song_themes.can_generate(&self.playback),
+            generating: self.song_themes.generating,
             i18n: &self.i18n,
             text: folia_visualizer::color(self.theme.primary, 1.0),
             background: folia_visualizer::color(self.theme.background, 1.0),
@@ -2684,8 +3849,9 @@ impl Shell {
             has_track: self.playback.current().is_some(),
             busy: self.library.busy,
             explore_refresh: self.library.explore_refresh(),
+            randomize_on_entry: self.general.wall_randomize_on_entry,
             volume: self.playback.settings.volume,
-            muted: self.playback.muted,
+            muted: self.playback.settings.muted,
             tokens: settings_kit::Tokens::new(&self.theme, self.appearance.theme == ThemeMode::Light),
             queue: self.playback.queue.items(),
             queue_index: self.playback.queue.current_index(),
@@ -2736,7 +3902,15 @@ impl Shell {
             },
             |flip| flip.layout,
         );
-        host.opacity = content_opacity(host.seam.width, layout.max(1.0))
+        let seam = host.seam;
+        let at_seam = self
+            .clock
+            .pointer
+            .is_some_and(|(x, y)| ((if seam.horizontal { y } else { x }) - seam.center).abs() <= seam.width / 2.0);
+        let active = at_seam || host.search.is_some() || self.library.filter_editing() || self.home.more_open();
+        let seam_fade = if !active && !host.wall.lights_on { 0.4 } else { 1.0 };
+        host.opacity = seam_fade
+            * content_opacity(host.seam.width, layout.max(1.0))
             * self.seam_flip.as_ref().map_or(1.0, |flip| flip.opacity(now));
         host
     }
@@ -2803,7 +3977,7 @@ impl Shell {
 
     /// The seam's account entry on online tabs (`useBravaisHomeAccount`).
     fn account_slot(&self) -> Option<home::AccountSlot<'_>> {
-        if !self.library.tab.is_online() || self.library.layer.is_some() {
+        if self.sources.custom_only() || !self.library.tab.is_online() || self.library.layer.is_some() {
             return None;
         }
         let platforms = self.library.online.platforms();
@@ -2850,7 +4024,9 @@ impl Shell {
             self.art_pending = None;
         }
         let mode = folia_visualizer::Background::resolve(self.appearance.stored_background_mode());
-        let full = matches!(mode, folia_visualizer::Background::Monet | folia_visualizer::Background::Nomand);
+        let full = self.scene_active()
+            || matches!(mode, folia_visualizer::Background::Monet | folia_visualizer::Background::Nomand)
+            || mode == folia_visualizer::Background::Common && self.appearance.use_cover_color_bg;
         if self.art_pending.is_some_and(|(pending, _)| pending == id) && (!full || self.art_request_full) {
             return Task::none();
         }
@@ -2928,6 +4104,7 @@ impl Shell {
         let style = self.appearance.visualizer.clone();
         let (quality_levels, quality) = self.audio_quality();
         let room = panel::Room {
+            background: folia_visualizer::Background::resolve(self.appearance.stored_background_mode()),
             width: self.window_size.width,
             height: self.window_size.height,
             bottom: self.bar_offset(),
@@ -2941,24 +4118,17 @@ impl Shell {
         let task = match effect {
             panel::Effect::None => Task::none(),
             panel::Effect::Home => {
-                self.page = Page::Library;
+                self.return_home();
                 Task::none()
             }
-            panel::Effect::Locate => {
-                self.page = Page::Library;
-                match self.playback.current().map(|track| track.id) {
-                    Some(track) => self.library_message(library::Message::Locate(track)),
-                    None => Task::none(),
-                }
-            }
+            panel::Effect::Locate => self.locate_playback_source(),
             panel::Effect::Settings => {
                 self.settings = Some(settings::Settings::open());
                 Task::none()
             }
-            panel::Effect::Workbench => {
-                let mut window = workbench::Workbench::open();
-                window.values = self.tuning_of(self.style());
-                self.workbench = Some(window);
+            panel::Effect::Workbench => self.open_workbench(),
+            panel::Effect::Scene => {
+                self.scene_window = Some(scene_settings::State::open());
                 Task::none()
             }
             panel::Effect::Intensity => {
@@ -2968,22 +4138,35 @@ impl Shell {
                     folia_core::AnimationIntensity::Normal => folia_core::AnimationIntensity::Chaotic,
                     folia_core::AnimationIntensity::Chaotic => folia_core::AnimationIntensity::Calm,
                 };
-                self.theme =
-                    theme_for(&self.theme_settings, self.appearance.theme, self.appearance.animation_intensity);
+                self.theme = theme_for(
+                    &self.theme_settings,
+                    self.appearance.theme,
+                    self.appearance.animation_intensity,
+                    self.song_themes.applied.as_ref(),
+                );
                 self.iced_theme = iced_theme(&self.theme);
                 self.appearance_changed(&before)
             }
             panel::Effect::Playback(message) => self.playback.update(message, &self.store).map(Message::Playback),
             panel::Effect::Theme(mode) => {
                 let before = self.appearance.clone();
+                self.appearance.follow_system_theme = false;
                 self.appearance.theme = mode;
-                self.theme = theme_for(&self.theme_settings, mode, self.appearance.animation_intensity);
+                self.theme = theme_for(
+                    &self.theme_settings,
+                    mode,
+                    self.appearance.animation_intensity,
+                    self.song_themes.applied.as_ref(),
+                );
                 self.iced_theme = iced_theme(&self.theme);
                 self.appearance_changed(&before)
             }
             panel::Effect::Visualizer(style) => {
                 self.appearance.visualizer = style.map_or(RANDOM_STYLE, Style::id).to_owned();
                 save(&self.store, &self.appearance)
+            }
+            panel::Effect::Login | panel::Effect::Sync | panel::Effect::SignOut if self.sources.custom_only() => {
+                Task::none()
             }
             panel::Effect::Login => {
                 let provider = self.playing_provider();
@@ -3021,14 +4204,45 @@ impl Shell {
                 if source == folia_store::ThemeSource::Custom && self.theme_settings.custom_dual_theme.is_none() {
                     return Task::none();
                 }
+                if source == folia_store::ThemeSource::Ai {
+                    let theme = self
+                        .song_themes
+                        .current
+                        .clone()
+                        .or(self.song_themes.applied.clone())
+                        .unwrap_or_else(folia_ai::default_theme);
+                    self.song_themes.applied = Some(theme);
+                }
                 self.theme_settings.source = source;
-                self.theme =
-                    theme_for(&self.theme_settings, self.appearance.theme, self.appearance.animation_intensity);
+                self.theme = theme_for(
+                    &self.theme_settings,
+                    self.appearance.theme,
+                    self.appearance.animation_intensity,
+                    self.song_themes.applied.as_ref(),
+                );
                 self.iced_theme = iced_theme(&self.theme);
                 let theme_settings = self.theme_settings.clone();
-                save(&self.store, &theme_settings)
+                Task::batch([save(&self.store, &theme_settings), self.song_themes.remember()])
+            }
+            panel::Effect::GenerateTheme => {
+                let colors = self.playback.current().and_then(|track| self.cover_palettes.get(track.id)).unwrap_or(&[]);
+                self.song_themes.update(song_theme::Message::Generate, &self.store, &self.playback, colors)
+            }
+            panel::Effect::Catalog(message) => self.catalog_message(message),
+            panel::Effect::TransparentBackground(enabled) => {
+                self.theme_settings.transparent_player_background = enabled;
+                tracing::info!(enabled, "player background transparency changed");
+                save(&self.store, &self.theme_settings)
+            }
+            panel::Effect::Background(background) => {
+                let before = self.appearance.clone();
+                self.appearance.set_background_mode(Some(background.id()));
+                self.appearance_changed(&before)
             }
             panel::Effect::QuickEditOpen => {
+                if self.theme_settings.source == folia_store::ThemeSource::Ai {
+                    return self.handle(Message::OpenThemePark);
+                }
                 self.sheets.open_editor(self.theme_settings.custom_dual_theme.as_ref(), self.theme_is_light());
                 Task::none()
             }
@@ -3097,19 +4311,15 @@ impl Shell {
         self.playback.current().filter(|track| track.online.is_none() && track.id > 0).map(|track| track.id)
     }
 
-    fn favorite_ids(&self) -> std::collections::HashSet<i64> {
-        self.playlists
-            .iter()
-            .find(|playlist| playlist.favorite)
-            .map(|playlist| playlist.song_ids.iter().copied().collect())
-            .unwrap_or_default()
+    fn local_song_liked(&self, id: i64) -> bool {
+        self.playlists.iter().find(|playlist| playlist.favorite).is_some_and(|playlist| playlist.song_ids.contains(&id))
     }
 
     fn song_liked(&self) -> bool {
         match self.playback.current() {
             Some(track) => match &track.online {
                 Some(online) => self.library.online.is_liked(&online.provider, &online.id),
-                None => self.local_track().is_some_and(|id| self.favorite_ids().contains(&id)),
+                None => self.local_track().is_some_and(|id| self.local_song_liked(id)),
             },
             None => false,
         }
@@ -3230,7 +4440,7 @@ impl Shell {
             return Task::batch([load, press]);
         }
         let Some(id) = self.local_track() else { return Task::none() };
-        let favorite = !self.favorite_ids().contains(&id);
+        let favorite = !self.local_song_liked(id);
         let path = self.db_path.clone();
         let task = blocking(move || {
             let library = folia_library::Library::open(&path).map_err(|err| error_chain(&err))?;
@@ -3436,22 +4646,14 @@ impl Shell {
     }
 
     fn save_queue(&mut self, name: String) -> Task<Message> {
-        let ids: Vec<i64> = self
-            .playback
-            .queue
-            .items()
-            .iter()
-            .filter(|track| track.online.is_none() && track.id > 0)
-            .map(|track| track.id)
-            .collect();
-        if ids.is_empty() || ids.len() != self.playback.queue.items().len() {
+        if !self.playback.can_save_queue() {
             return Task::none();
         }
+        let ids: Vec<i64> = self.playback.queue.items().iter().map(|track| track.id).collect();
         let path = self.db_path.clone();
         let task = blocking(move || {
-            let library = folia_library::Library::open(&path).map_err(|err| error_chain(&err))?;
-            let playlist = library.create_playlist(&name).map_err(|err| error_chain(&err))?;
-            library.add_to_playlist(playlist.id, &ids).map_err(|err| error_chain(&err))?;
+            let mut library = folia_library::Library::open(&path).map_err(|err| error_chain(&err))?;
+            library.save_queue(&name, &ids).map_err(|err| error_chain(&err))?;
             library.playlists().map_err(|err| error_chain(&err))
         });
         Task::perform(task, |result| {
@@ -3471,8 +4673,12 @@ impl Shell {
             panel_sheets::Event::SaveTheme(theme) => {
                 self.theme_settings.custom_dual_theme = Some(theme);
                 self.theme_settings.source = folia_store::ThemeSource::Custom;
-                self.theme =
-                    theme_for(&self.theme_settings, self.appearance.theme, self.appearance.animation_intensity);
+                self.theme = theme_for(
+                    &self.theme_settings,
+                    self.appearance.theme,
+                    self.appearance.animation_intensity,
+                    self.song_themes.applied.as_ref(),
+                );
                 self.iced_theme = iced_theme(&self.theme);
                 let theme_settings = self.theme_settings.clone();
                 save(&self.store, &theme_settings)
@@ -3486,9 +4692,15 @@ impl Shell {
         if !matches!(message, home::Message::CollectionMenu) {
             self.library.dismiss_menu();
         }
-        let reopen = matches!(message, home::Message::Tab) && !self.home.is_hidden();
+        let reopen = matches!(message, home::Message::Tab);
         let query = self.home.search_query().map(str::to_owned);
         let queue_open = self.home.queue_island_open();
+        let playlist_name = matches!(message, home::Message::CommitQueue)
+            .then(|| self.home.queue_name().unwrap_or_default().trim().to_owned());
+        if matches!(message, home::Message::LatticeCommands) && self.page != Page::Lattice {
+            return Task::none();
+        }
+        let dock_delta = self.home.dock_delta();
         self.home.update(&message);
         let now = std::time::Instant::now();
         let mut extra = Task::none();
@@ -3498,6 +4710,15 @@ impl Shell {
         }
         let mut replan = reopen;
         let task = match message {
+            home::Message::RandomizeOnEntry => {
+                self.general.wall_randomize_on_entry = !self.general.wall_randomize_on_entry;
+                Task::batch([
+                    self.library
+                        .set_randomize_on_entry(self.general.wall_randomize_on_entry, &self.i18n)
+                        .map(Message::Library),
+                    save(&self.store, &self.general),
+                ])
+            }
             home::Message::TitleFocus { backwards } => {
                 if backwards {
                     iced::widget::operation::focus_previous()
@@ -3505,6 +4726,7 @@ impl Shell {
                     iced::widget::operation::focus_next()
                 }
             }
+            home::Message::Search if self.page == Page::Lattice => Task::none(),
             home::Message::Search => {
                 if self.library.layer.is_some() {
                     Task::none()
@@ -3521,11 +4743,13 @@ impl Shell {
                 replan = true;
                 self.search.begin(query);
                 self.search.reveal();
+                self.remember_page();
                 self.page = Page::Search;
                 let provider = self.library.online.provider();
                 let (task, _) = self.search.update(search::Message::Submit, self.omni.as_ref(), provider);
                 task.map(Message::Search)
             }
+            home::Message::Catalog(message) => self.catalog_message(message),
             home::Message::SearchQuery(_) => Task::none(),
             home::Message::EscapeSearch => {
                 if self.home.search_query().is_none() {
@@ -3538,9 +4762,16 @@ impl Shell {
                 replan = true;
                 Task::none()
             }
+            home::Message::ToolsQueue(_) | home::Message::ToolsQueueClear if self.playback.is_fm() => Task::none(),
             home::Message::ToolsQueue(message) => {
                 let queue = self.playback.queue.items();
-                let list_h = queue_island::list_height(queue.len());
+                let list_h = self.home.list_height(
+                    self.window_size,
+                    std::time::Instant::now(),
+                    queue.len(),
+                    self.page == Page::Lattice,
+                    self.playback.is_fm() || self.appearance.wall.radio,
+                );
                 let (task, change) = self.home.queue_update(message, queue, list_h);
                 let effect = match change {
                     Some(queue_island::Change::Jump(index)) => {
@@ -3562,15 +4793,165 @@ impl Shell {
                 };
                 Task::batch([task.map(|message| Message::Home(home::Message::ToolsQueue(message))), effect])
             }
+            home::Message::ToggleLattice if self.page == Page::Lattice => self.navigate_back(),
+            home::Message::Destination | home::Message::ToggleLattice => {
+                self.play_navigation.cancel();
+                if self.page == Page::Lattice {
+                    self.return_home();
+                    Task::none()
+                } else {
+                    self.remember_page();
+                    self.page = Page::Lattice;
+                    Task::none()
+                }
+            }
+            home::Message::Back if self.page == Page::Lattice => self.navigate_back(),
+            home::Message::PosterDetails => {
+                self.handle(Message::Lattice(self.lattice_generation, lattice::Message::Details))
+            }
+            home::Message::AutoFocus(on) => {
+                self.appearance.wall.auto_focus = on;
+                save(&self.store, &self.appearance)
+            }
+            home::Message::Vignette(on) => {
+                self.appearance.wall.vignette = on;
+                save(&self.store, &self.appearance)
+            }
+            home::Message::BadgeCurrentOnly(on) => {
+                self.appearance.wall.badge_current_only = on;
+                save(&self.store, &self.appearance)
+            }
+            home::Message::LocatePlaying if self.page == Page::Lattice => {
+                self.handle(Message::Lattice(self.lattice_generation, lattice::Message::Locate))
+            }
+            home::Message::LocatePlaying => self.locate_playback_source(),
+            home::Message::GenerateTheme => self.panel(panel::Message::GenerateTheme),
+            home::Message::Shuffle => self.panel(panel::Message::Shuffle),
+            home::Message::DockRelease => self.home(if dock_delta.unwrap_or_default() >= 36.0 {
+                home::Message::Commands
+            } else {
+                home::Message::Tools
+            }),
+            home::Message::DockPress(_)
+            | home::Message::DockMove(_)
+            | home::Message::DockCancel
+            | home::Message::QueueName(_) => Task::none(),
+            home::Message::Chord | home::Message::LatticeCommands | home::Message::Commands => {
+                iced::widget::operation::focus("wall-commands")
+            }
+            home::Message::CommandQuery(query) if self.home.executing() => {
+                let action = match query.to_ascii_lowercase().as_str() {
+                    "r" => Some(home::Message::Shuffle),
+                    "c" => Some(home::Message::LocatePlaying),
+                    "p" if self.page == Page::Library => {
+                        Some(home::Message::WallLook(self.appearance.wall.look.next()))
+                    }
+                    _ => None,
+                };
+                action.map_or_else(Task::none, |action| self.home(home::Message::RunCommand(Box::new(action))))
+            }
+            home::Message::RunCommand(action) => self.home(*action),
+            home::Message::CacheDirectory => self.storage_message(storage::Message::Choose),
+            home::Message::Scrobble => self
+                .playback
+                .update(playback::Message::Scrobble(!self.playback.settings.netease_scrobble_enabled), &self.store)
+                .map(Message::Playback),
+            home::Message::CommandQuery(_) => Task::none(),
+            home::Message::CycleTab(backwards) => {
+                if self.page != Page::Library || self.library.layer.is_some() {
+                    return Task::none();
+                }
+                let tabs = library::TABS;
+                let index = tabs.iter().position(|&tab| tab == self.library.tab).unwrap_or(0);
+                self.home(home::Message::SelectTab(
+                    tabs[(index + if backwards { tabs.len() - 1 } else { 1 }) % tabs.len()],
+                ))
+            }
+            home::Message::QueueSearch(Some(query)) if query.is_empty() => {
+                iced::widget::operation::focus("wall-queue-search")
+            }
+            home::Message::QueueSearch(_) => Task::none(),
+            home::Message::SaveQueue => iced::widget::operation::focus("wall-playlist-name"),
+            home::Message::CommitQueue => {
+                playlist_name.filter(|name| !name.is_empty()).map_or_else(Task::none, |name| self.save_queue(name))
+            }
+            home::Message::ExportAppearance => match self.appearance.wall.export() {
+                Ok(text) => iced::clipboard::write(text),
+                Err(err) => {
+                    tracing::warn!(error = &err as &dyn std::error::Error, "wall preset export failed");
+                    self.status(false, self.i18n.t("wallTools.invalidPreset").to_owned())
+                }
+            },
+            home::Message::ImportAppearance => {
+                iced::clipboard::read().map(|text| Message::Home(home::Message::PastedAppearance(text)))
+            }
+            home::Message::PastedAppearance(text) => {
+                match folia_store::WallAppearance::import(
+                    text.as_deref().filter(|text| text.len() <= 65536).unwrap_or_default(),
+                ) {
+                    Ok(wall) => {
+                        self.appearance.wall = wall;
+                        save(&self.store, &self.appearance)
+                    }
+                    Err(_) => {
+                        tracing::debug!("invalid wall preset");
+                        self.status(false, self.i18n.t("wallTools.invalidPreset").to_owned())
+                    }
+                }
+            }
+            home::Message::CommitAppearance => save(&self.store, &self.appearance),
+            home::Message::WallLook(_)
+            | home::Message::Windows(_)
+            | home::Message::Tint(_)
+            | home::Message::Lights(_)
+            | home::Message::CustomTint(_)
+            | home::Message::Intensity(_)
+            | home::Message::TintColor(_)
+            | home::Message::SeamClear(_)
+            | home::Message::BackdropLyrics(_)
+            | home::Message::BackdropBlur(_)
+            | home::Message::Radio(_)
+            | home::Message::HideUpcoming(_) => {
+                let wall = &mut self.appearance.wall;
+                match message {
+                    home::Message::WallLook(look) => wall.look = look,
+                    home::Message::Windows(count) if wall.look == folia_store::WallLook::Partial => {
+                        wall.windows_per_block = count.clamp(1, 6)
+                    }
+                    home::Message::Radio(on) if self.settings.is_some() || !self.playback.is_fm() => wall.radio = on,
+                    home::Message::HideUpcoming(on) => wall.hide_upcoming = on,
+                    home::Message::Tint(on) => wall.tint = on,
+                    home::Message::Lights(on) => wall.lights_on = on,
+                    home::Message::CustomTint(on) => wall.custom_tint = on,
+                    home::Message::Intensity(value) => {
+                        wall.intensity = value.clamp(0.0, 1.0);
+                        return Task::none();
+                    }
+                    home::Message::TintColor(color) => {
+                        wall.tint_color = color;
+                        return Task::none();
+                    }
+                    home::Message::SeamClear(on) => wall.seam_clear = on,
+                    home::Message::BackdropLyrics(on) => wall.backdrop_lyrics = on,
+                    home::Message::BackdropBlur(on) => wall.backdrop_blur = on,
+                    _ => return Task::none(),
+                }
+                save(&self.store, &self.appearance)
+            }
             home::Message::ToolsQueueClear => {
                 let (clear, task) = self.home.press_queue_clear(now);
-                if clear {
-                    self.playback.clear_queue();
-                }
-                task.map(Message::Home)
+                let notice = if clear && self.playback.clear_queue() {
+                    self.status(true, self.i18n.t("status.queueCleared").to_owned())
+                } else {
+                    Task::none()
+                };
+                Task::batch([task.map(Message::Home), notice])
             }
             home::Message::Player => {
                 if self.playback.current().is_some() {
+                    if self.page != Page::NowPlaying {
+                        self.remember_page();
+                    }
                     self.page = Page::NowPlaying;
                     self.reveal_chrome();
                 }
@@ -3599,7 +4980,25 @@ impl Shell {
                 self.home.help_scrolled(&viewport);
                 Task::none()
             }
-            home::Message::Frame => self.home.scroll_frame().map(Message::Home),
+            home::Message::Frame => {
+                let scroll = self.home.scroll_frame().map(Message::Home);
+                if self.page == Page::Lattice {
+                    let queue = self.playback.queue.items();
+                    Task::batch([
+                        scroll,
+                        self.home
+                            .queue_frame(
+                                queue,
+                                self.playback.queue.current_index(),
+                                queue_island::list_height(queue.len()),
+                                now,
+                            )
+                            .map(|message| Message::Home(home::Message::ToolsQueue(message))),
+                    ])
+                } else {
+                    scroll
+                }
+            }
             home::Message::LocateRow(row) => self.library_message(library::Message::LocateRow(row)),
             home::Message::PlayRow(row) => self.library_message(library::Message::PlayRow(row)),
             home::Message::ToggleSubscribe => self.library_message(library::Message::ToggleSubscribe),
@@ -3760,9 +5159,19 @@ fn theme_for(
     settings: &folia_store::ThemeSettings,
     mode: ThemeMode,
     intensity: folia_core::AnimationIntensity,
+    song: Option<&folia_store::DualTheme>,
 ) -> Theme {
-    match (&settings.custom_dual_theme, settings.source) {
-        (Some(dual), folia_store::ThemeSource::Custom) => {
+    if settings.source == folia_store::ThemeSource::Ai && song.is_none() {
+        let fallback = folia_ai::default_theme();
+        return if mode == ThemeMode::Light { fallback.light.theme(intensity) } else { fallback.dark.theme(intensity) };
+    }
+    let selected = match settings.source {
+        folia_store::ThemeSource::Default => None,
+        folia_store::ThemeSource::Custom => settings.custom_dual_theme.as_ref(),
+        folia_store::ThemeSource::Ai => song,
+    };
+    match selected {
+        Some(dual) => {
             let side = if mode == ThemeMode::Light { &dual.light } else { &dual.dark };
             side.theme(intensity)
         }
@@ -3804,7 +5213,11 @@ fn open_folder(folder: std::path::PathBuf) -> Task<Message> {
     )
 }
 
-/// Space toggles play. Subscribed only when a track is loaded and no sheet is open.
+/// Lattice consumes the same uncaptured Space event for its focused poster's controls.
+fn lattice_space_key(event: iced::Event, status: iced::event::Status, id: iced::window::Id) -> Option<Message> {
+    space_key(event, status, id).map(|_| Message::Home(home::Message::PosterDetails))
+}
+
 fn space_key(event: iced::Event, status: iced::event::Status, _id: iced::window::Id) -> Option<Message> {
     space_toggle(event, status)
 }
@@ -3881,6 +5294,16 @@ fn settings_key(event: iced::Event, status: iced::event::Status, _id: iced::wind
     }
 }
 
+fn scene_settings_key(event: iced::Event, status: iced::event::Status, _id: iced::window::Id) -> Option<Message> {
+    match event {
+        iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+            key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
+            ..
+        }) if status == iced::event::Status::Ignored => Some(Message::SceneSettings(scene_settings::Message::Close)),
+        _ => None,
+    }
+}
+
 fn workbench_key(event: iced::Event, status: iced::event::Status, _id: iced::window::Id) -> Option<Message> {
     if status == iced::event::Status::Captured {
         return None;
@@ -3892,6 +5315,10 @@ fn workbench_key(event: iced::Event, status: iced::event::Status, _id: iced::win
         }) => Some(Message::Workbench(workbench::Message::Close)),
         _ => None,
     }
+}
+
+fn theme_park_key(event: iced::Event, status: iced::event::Status, id: iced::window::Id) -> Option<Message> {
+    workbench_key(event, status, id).map(|_| Message::ThemePark(theme_park::Message::Close))
 }
 
 /// Presses keep the chrome up; a scroll wheel counts as activity. Neither captures the event.
@@ -3918,6 +5345,7 @@ fn window_pointer(event: iced::Event, _status: iced::event::Status, window: iced
         }
         iced::Event::Mouse(iced::mouse::Event::CursorLeft) => Some(Message::Pointer(window, None)),
         iced::Event::Window(iced::window::Event::Unfocused) => Some(Message::WindowUnfocused),
+        iced::Event::Window(iced::window::Event::CloseRequested) => Some(Message::WindowClosing),
         _ => None,
     }
 }
@@ -3979,6 +5407,11 @@ fn wall_key(event: iced::Event, status: iced::event::Status, _id: iced::window::
     };
     Some(match home::wall_key_of(&key, modifiers, repeat)? {
         home::WallKey::Focus { backwards } => Message::Home(home::Message::TitleFocus { backwards }),
+        home::WallKey::Destination => Message::Home(home::Message::ToggleLattice),
+        home::WallKey::Chord => Message::Home(home::Message::Chord),
+        home::WallKey::Commands => Message::Home(home::Message::Commands),
+        home::WallKey::LatticeCommands => Message::Home(home::Message::LatticeCommands),
+        home::WallKey::CycleTab(backwards) => Message::Home(home::Message::CycleTab(backwards)),
         home::WallKey::Search => Message::Home(home::Message::Search),
         home::WallKey::Card(key) => Message::Library(library::Message::Key(key)),
     })
@@ -4070,4 +5503,20 @@ fn wall_ms() -> f64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs_f64() * 1000.0)
         .unwrap_or(0.0)
+}
+
+fn catalog_key(event: iced::Event, status: iced::event::Status, _window: iced::window::Id) -> Option<Message> {
+    if status == iced::event::Status::Ignored
+        && matches!(
+            event,
+            iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
+                ..
+            })
+        )
+    {
+        Some(Message::Back)
+    } else {
+        None
+    }
 }

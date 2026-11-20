@@ -2,22 +2,31 @@
 
 #![cfg(test)]
 
+mod catalog;
 mod chrome_motion;
 mod fonts;
 mod glass_tone;
 mod icon_dots;
 mod loading;
+mod login_methods;
 #[cfg(test)]
 mod monet;
 mod panelfix;
+mod picker;
 mod player_bar;
+mod player_fixture;
 mod polish;
 mod reorder;
+mod scene;
 mod scroll_timeline;
 mod seam_title;
+mod session;
+mod settings_layout;
 #[cfg(all(feature = "stress", not(feature = "ci")))]
 mod text_atlas;
+mod transparent;
 mod wall_loading;
+mod wall_tools;
 mod workbench;
 
 use folia_core::Line;
@@ -320,3 +329,6 @@ mod provider_highlight;
 
 #[cfg(test)]
 mod playback_navigation;
+
+#[cfg(test)]
+mod themes;

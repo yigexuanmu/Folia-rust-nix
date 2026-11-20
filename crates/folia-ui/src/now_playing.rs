@@ -9,6 +9,18 @@ use iced::{Alignment, Color, Element, Font, Length, Size};
 
 use crate::overlay::{self, SubtitleRows};
 
+/// The same lyric composition can fill the window or be projected onto a scene surface.
+pub enum Surface<'a> {
+    Flat(Scene<'a>),
+    Cinema { scene: Scene<'a>, config: folia_visualizer::cinema::Config<'a> },
+}
+
+impl<'a> From<Scene<'a>> for Surface<'a> {
+    fn from(scene: Scene<'a>) -> Self {
+        Self::Flat(scene)
+    }
+}
+
 /// Where the subtitle sits, and whether a glass plate needs the picture behind it.
 pub struct Foot {
     pub bottom: f32,
@@ -19,6 +31,7 @@ pub struct Foot {
 /// The shared background behind styles that show one. `vignette` is the geometric edge, not the atmosphere.
 #[derive(Clone, Copy)]
 pub struct Backdrop {
+    pub static_mode: bool,
     pub mode: Background,
     pub shapes: bool,
     pub vignette: bool,
@@ -28,17 +41,20 @@ pub struct Backdrop {
 /// Where the picture is and how strong its vignette and bottom subtitle are.
 #[derive(Clone, Copy)]
 pub struct Screen<'a> {
+    pub transparent: bool,
     pub window: Size,
     pub vignette: f32,
     pub subtitle_opacity: f32,
     pub subtitle_background: bool,
     pub subtitle_blur: bool,
+    pub harmony: &'a folia_store::SubtitleSettings,
     pub dpi: f32,
     pub opacity: f32,
     pub subtitle_scale: f32,
     pub subtitle_font: Font,
     pub shared: Backdrop,
     pub cover: &'a [folia_core::Rgb],
+    pub cover_overlay: Option<f32>,
     pub latent: folia_visualizer::LatentTuning,
     pub daylight: bool,
     pub sora: folia_visualizer::SoraTuning,
@@ -56,16 +72,30 @@ pub fn view<'a, M: From<folia_visualizer::styles::monet::Event> + 'a>(
     subtitle: SubtitleRows<'a>,
     foot: Foot,
 ) -> Element<'a, M> {
-    let has_lyrics = !scene.lyrics.lines.is_empty();
-    let time = scene.time as f32;
-    let glass = foot.glass;
-    let bottom = foot.bottom;
-    let window = screen.window;
-    let subtitle_opacity = screen.subtitle_opacity;
-    let subtitle_scale = screen.subtitle_scale;
-    let show = scene.style.shows_shared_background();
-    let flat = !matches!(scene.style, folia_visualizer::Style::Nebbia | folia_visualizer::Style::Lumiere);
-    let ground = Ground {
+    composition(scene, i18n, (muted, background), screen, subtitle, foot, false)
+}
+
+pub fn projected<'a>(
+    surface: Surface<'a>,
+    i18n: &'a I18n,
+    muted: Color,
+    background: Color,
+    mut screen: Screen<'a>,
+    subtitle: SubtitleRows<'a>,
+    foot: Foot,
+) -> Element<'a, crate::Message> {
+    let (scene, config) = match surface {
+        Surface::Flat(scene) => return view(scene, i18n, muted, background, screen, subtitle, foot),
+        Surface::Cinema { scene, config } => (scene, config),
+    };
+    screen.window.height = screen.window.width / folia_visualizer::cinema::SCREEN_ASPECT;
+    let source = composition(scene, i18n, (muted, background), screen, subtitle, foot, true);
+    folia_visualizer::cinema::view(source, config, crate::Message::SceneFailed)
+}
+
+fn ground<'a>(scene: &Scene<'a>, screen: Screen<'a>, publish: bool) -> Ground<'a> {
+    Ground {
+        static_mode: screen.shared.static_mode,
         mode: screen.shared.mode,
         seed: scene.seed,
         time: scene.time,
@@ -73,26 +103,86 @@ pub fn view<'a, M: From<folia_visualizer::styles::monet::Event> + 'a>(
         audio: scene.audio,
         shapes: screen.shared.shapes,
         vignette: screen.shared.vignette,
-        publish: !scene.preview,
+        publish,
         paused: screen.shared.paused,
         player: !scene.preview,
         cover: screen.cover,
+        cover_overlay: screen.cover_overlay,
         latent: screen.latent,
         daylight: screen.daylight,
         sora: screen.sora,
         monet: screen.monet,
         picture: screen.picture,
         nomand: screen.nomand,
+    }
+}
+
+pub fn wall<'a>(
+    surface: Surface<'a>,
+    screen: Screen<'a>,
+    appearance: folia_store::WallAppearance,
+) -> Element<'a, crate::Message> {
+    let scene = match surface {
+        Surface::Flat(scene) | Surface::Cinema { scene, .. } => scene,
     };
-    let scene = Scene { backdrop: scene.backdrop && !show, ..scene };
-    let visualizer = lyric_view(scene);
+    let shared = scene.shows_shared_background();
+    let mut layers = stack![];
+    if shared {
+        layers = layers.push(background_view(ground(&scene, screen, !appearance.backdrop_blur)));
+    }
+    if appearance.backdrop_lyrics || !shared {
+        layers = layers.push(lyric_view(Scene { backdrop: !shared, ..scene }));
+    }
+    if appearance.backdrop_blur {
+        folia_render::quality::wall_layer(layers.into(), Some(folia_render::quality::WallLayer::BlurredPlayer), None)
+    } else {
+        layers.into()
+    }
+}
+
+fn composition<'a, M: From<folia_visualizer::styles::monet::Event> + 'a>(
+    scene: Scene<'a>,
+    i18n: &'a I18n,
+    colors: (Color, Color),
+    screen: Screen<'a>,
+    subtitle: SubtitleRows<'a>,
+    foot: Foot,
+    projected: bool,
+) -> Element<'a, M> {
+    let (muted, background) = colors;
+    let has_lyrics = !scene.lyrics.lines.is_empty();
+    let time = scene.time as f32;
+    let glass = foot.glass && !projected;
+    let bottom = foot.bottom;
+    let window = screen.window;
+    let subtitle_opacity = screen.subtitle_opacity;
+    let subtitle_scale = screen.subtitle_scale;
+    let show = scene.shows_shared_background() && !screen.transparent;
+    let flat = !matches!(scene.style, folia_visualizer::Style::Nebbia | folia_visualizer::Style::Lumiere);
+    let ground = ground(&scene, screen, !scene.preview && !projected);
+    let scene = Scene { backdrop: scene.backdrop && !show && !screen.transparent, ..scene };
+    let harmony = screen.harmony.show_harmony.then(|| {
+        crate::harmony::view(
+            scene.lyrics,
+            scene.time,
+            scene.theme,
+            screen.harmony,
+            [
+                scene.typography.subtitle_font(Font { weight: iced::font::Weight::Medium, ..Font::DEFAULT }),
+                scene.typography.subtitle_font(Font::DEFAULT),
+            ]
+            .map(crate::typeface::adapt),
+            screen.dpi,
+        )
+    });
+    let visualizer = if projected { folia_visualizer::lyric_surface(scene) } else { lyric_view(scene) };
     let show_glow = subtitle.rows.iter().any(Option::is_some);
     let alpha = subtitle_opacity.clamp(0.0, 1.0);
     let ellipse = subtitle_ellipse(&subtitle, window, bottom, subtitle_scale, screen.subtitle_font);
     let atmosphere = shader(Program::new(Atmosphere {
         time,
-        vignette: if show { 0.0 } else { screen.vignette.clamp(0.0, 1.0) },
-        grain: 0.04,
+        vignette: if show || screen.transparent { 0.0 } else { screen.vignette.clamp(0.0, 1.0) },
+        grain: if screen.transparent { 0.0 } else { 0.04 },
         glow_center: ellipse.center,
         glow_radius: ellipse.radius,
         glow_rgb: [background.r, background.g, background.b],
@@ -103,7 +193,7 @@ pub fn view<'a, M: From<folia_visualizer::styles::monet::Event> + 'a>(
     let mut layers = stack![];
     // Styles with their own picture publish it. A flat style that hides the shared background still
     // falls back to the theme colour; the shared layer is captured with the lyrics instead.
-    if glass && flat && !show {
+    if glass && flat && !show && !screen.transparent {
         let picture = folia_render::BackdropScene {
             window: [window.width, window.height],
             ground: [background.r, background.g, background.b, 1.0],
@@ -133,6 +223,9 @@ pub fn view<'a, M: From<folia_visualizer::styles::monet::Event> + 'a>(
     } else if !has_lyrics {
         let empty = container(text(i18n.t("ui.noLyricsAvailable")).color(muted)).center(Length::Fill);
         layers = layers.push(empty);
+    }
+    if let Some(harmony) = harmony {
+        layers = layers.push(harmony);
     }
     if screen.opacity < 1.0 {
         layers =

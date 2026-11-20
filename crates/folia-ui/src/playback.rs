@@ -4,32 +4,43 @@ use std::time::{Duration, Instant};
 
 use folia_core::{AudioFrame, AudioInput, AudioQuality, ChorusRange, Lyrics, Queue, Repeat, ReplayGain, Track};
 use folia_lyrics::{ChorusSource, chorus_ranges_of, resolve_chorus};
-use folia_omni::{Collection, Omni};
-use folia_player::{Player, PlayerState, Status};
-use folia_store::{PlaybackSettings, ReplayGainMode, Store};
+use folia_omni::{Collection, CollectionKind, Omni};
+use folia_player::{ListenTracker, Player, PlayerState, Status};
+use folia_store::{FmSession, PlaybackSession, PlaybackSettings, ReplayGainMode, Store};
 use iced::Task;
 
 use crate::background::{blocking, error_chain, save};
 
 pub struct Playback {
+    cache_pause: Option<(u64, bool)>,
+    listen: ListenTracker,
+    listened_track: Option<(Track, AudioQuality)>,
+    report_task: Option<iced::task::Handle>,
+    report_serial: u64,
     player: Option<Player>,
     omni: Option<Omni>,
     pub queue: Queue<Track>,
     pub lyrics: Option<Lyrics>,
+    lyrics_pending: bool,
     pub status: Status,
     pub settings: PlaybackSettings,
     /// Silenced without losing `settings.volume`, like the original `isMuted`.
-    pub muted: bool,
+    queue_ended: bool,
     /// Seconds the playing song's lyrics are moved later (`lyricTimelineOffsetMs`); every song starts at 0.
     pub lyric_offset: f64,
     seeking: Option<f64>,
+    restored: Option<(i64, f64)>,
+    start_position: f64,
+    seek_revision: u64,
     /// Tracks that failed one after another; playback stops once the whole queue has failed.
     failures: usize,
+    /// Keep the requested direction while skipping unplayable candidates.
+    failure_forward: bool,
     /// Personal FM's feed while the queue is FM (`isFmMode`): stepping on near its end fetches another batch.
     fm: Option<Collection>,
     /// A batch is on its way; steps wait for it.
     topping_up: bool,
-    notice: Option<(String, Instant)>,
+    notice: Option<(Notice, Instant)>,
     notice_serial: u64,
     request: u64,
     pub loading: Loading,
@@ -53,11 +64,20 @@ pub struct Playback {
 #[derive(Debug, Clone)]
 pub enum AudioFailure {
     SubscriptionRequired,
+    CustomSourceUnavailable,
     Other(String),
+}
+
+enum Notice {
+    Subscription(String),
+    CustomSourceUnavailable,
 }
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    Scrobble(bool),
+    Reported(u64),
+    Media(folia_media::Command),
     Toggle,
     Next,
     Previous,
@@ -102,7 +122,7 @@ impl Playback {
     pub fn new(settings: PlaybackSettings, omni: Option<Omni>) -> Self {
         let player = match Player::new() {
             Ok(player) => {
-                player.set_volume(settings.volume);
+                player.set_volume(if settings.muted { 0.0 } else { settings.volume });
                 Some(player)
             }
             Err(err) => {
@@ -114,16 +134,27 @@ impl Playback {
         queue.repeat = settings.repeat;
         let status = Status { state: PlayerState::Idle, position: 0.0, duration: 0.0 };
         Self {
+            cache_pause: None,
+            listen: ListenTracker::default(),
+            listened_track: None,
+            report_task: None,
+            report_serial: 0,
             player,
             omni,
             queue,
             lyrics: None,
+            lyrics_pending: false,
             status,
             settings,
-            muted: false,
+
+            queue_ended: false,
             lyric_offset: 0.0,
             seeking: None,
+            restored: None,
+            start_position: 0.0,
+            seek_revision: 0,
             failures: 0,
+            failure_forward: true,
             fm: None,
             topping_up: false,
             notice: None,
@@ -150,12 +181,82 @@ impl Playback {
         self.request
     }
 
+    pub fn seek_revision(&self) -> u64 {
+        self.seek_revision
+    }
+
     pub fn current(&self) -> Option<&Track> {
         self.queue.current()
     }
 
+    pub fn snapshot(&self) -> PlaybackSession {
+        let mut queue = self.queue.snapshot();
+        let current = queue.current.and_then(|index| queue.items.get_mut(index)).or(queue.detached.as_mut());
+        if let Some(track) = current {
+            track.duration = self.duration();
+        }
+        PlaybackSession {
+            queue,
+            position: self.heard_position(),
+            fm: self.fm.as_ref().map(|fm| FmSession {
+                provider: fm.provider.clone(),
+                id: fm.id.clone(),
+                name: fm.name.clone(),
+            }),
+        }
+        .normalized()
+    }
+
+    /// Restores transport metadata and lyrics without opening audio or prefetching the queue.
+    pub fn restore(&mut self, session: PlaybackSession) -> Task<Message> {
+        let session = session.normalized();
+        self.clear();
+        self.prefetch_task = None;
+        self.queue.restore(session.queue);
+        self.set_fm(session.fm.map(|fm| Collection {
+            provider: fm.provider,
+            id: fm.id,
+            name: fm.name,
+            kind: CollectionKind::PersonalFm,
+            cover_url: None,
+            track_count: None,
+            creator: None,
+            description: None,
+            owned: false,
+        }));
+        tracing::info!(
+            items = self.queue.items().len(),
+            position = session.position,
+            "playback session restored paused"
+        );
+        let Some(track) = self.current().cloned() else { return Task::none() };
+        self.restored = Some((track.id, session.position));
+        self.status = Status { state: PlayerState::Paused, position: session.position, duration: track.duration };
+        self.prefetch_dirty = false;
+        self.lyrics_pending = true;
+        self.read_lyrics(&track, self.request)
+    }
+
+    /// The exact representation currently heard, shared with cancellable offline analysis readers.
+    pub fn analysis_input(&self) -> Option<AudioInput> {
+        if self.restored.is_some() {
+            return None;
+        }
+        if !matches!(self.status.state, PlayerState::Playing | PlayerState::Paused) {
+            return None;
+        }
+        self.active_input
+            .clone()
+            .or_else(|| self.current().filter(|track| track.online.is_none()).map(|track| track.path.clone().into()))
+    }
+
     pub fn is_playing(&self) -> bool {
         self.status.state == PlayerState::Playing
+    }
+
+    /// A natural end of the last queue item, until playback starts again.
+    pub fn queue_ended(&self) -> bool {
+        self.queue_ended
     }
 
     pub fn is_buffering(&self) -> bool {
@@ -167,6 +268,21 @@ impl Playback {
         if let Some(player) = self.player.as_mut() {
             player.set_equalizer(parameters);
         }
+    }
+
+    pub fn room_sample_rate(&self) -> Option<u32> {
+        self.player.as_ref().map(Player::sample_rate)
+    }
+
+    pub fn set_room(
+        &mut self,
+        convolver: Option<Box<folia_player::RoomConvolver>>,
+    ) -> Result<(), folia_player::RoomError> {
+        self.player.as_mut().map_or(Ok(()), |player| player.set_room(convolver))
+    }
+
+    pub fn finish_room_change(&mut self) -> bool {
+        self.player.as_mut().is_none_or(Player::finish_room_change)
     }
 
     /// `replayGainMode` and the gains of the song that is playing.
@@ -183,6 +299,11 @@ impl Playback {
     /// Replaces the shown lyrics, for a match or an imported file.
     pub fn set_lyrics(&mut self, lyrics: Option<Lyrics>) {
         self.lyrics = lyrics;
+        self.lyrics_pending = false;
+    }
+
+    pub fn lyrics_loading(&self) -> bool {
+        self.lyrics_pending
     }
 
     /// The gain the mode applies to the playing song's tags.
@@ -202,7 +323,7 @@ impl Playback {
         if self.replay_gain == ReplayGainMode::Off || self.gain.is_none() {
             self.applied_db = 0.0;
         }
-        let level = if self.muted { 0.0 } else { self.settings.volume * self.gain_factor() };
+        let level = if self.settings.muted { 0.0 } else { self.settings.volume * self.gain_factor() };
         self.with_player(|player| player.set_volume(level.clamp(0.0, 1.0)));
     }
 
@@ -225,6 +346,13 @@ impl Playback {
         self.seeking.unwrap_or(self.status.position)
     }
 
+    pub fn heard_position(&self) -> f64 {
+        if self.restored.is_some() {
+            return self.position();
+        }
+        self.seeking.unwrap_or_else(|| self.player.as_ref().map_or(self.status.position, Player::heard_position))
+    }
+
     /// The time the lyrics are drawn at: a positive offset holds them back (`audioTime - offset`).
     pub fn lyric_time(&self) -> f64 {
         self.position() - self.lyric_offset
@@ -240,6 +368,9 @@ impl Playback {
 
     /// Replaces the queue with `tracks` and plays the one at `index`. `origin` is where they were started.
     pub fn play(&mut self, tracks: Vec<Track>, index: usize, origin: Option<folia_core::Origin>) -> Task<Message> {
+        if self.cache_pause.is_some() {
+            return Task::none();
+        }
         match origin {
             Some(origin) => self.queue.replace_from(tracks, index, origin),
             None => self.queue.replace(tracks, index),
@@ -250,6 +381,9 @@ impl Playback {
 
     /// Plays personal FM's first batch; stepping on near the end fetches more from `fm` (`fmNeedsTopUpAt`).
     pub fn play_fm(&mut self, tracks: Vec<Track>, fm: Collection, origin: folia_core::Origin) -> Task<Message> {
+        if self.cache_pause.is_some() {
+            return Task::none();
+        }
         self.queue.replace_from(tracks, 0, origin);
         self.set_fm(Some(fm));
         self.start_current()
@@ -268,6 +402,15 @@ impl Playback {
         self.queue.append(tracks, |a, b| a.id == b.id)
     }
 
+    /// Only a local song and an entirely local queue can be saved to the library index.
+    pub fn can_save_queue(&self) -> bool {
+        let indexed = |track: &Track| track.online.is_none() && track.id > 0;
+        !self.is_fm()
+            && self.current().is_some_and(indexed)
+            && !self.queue.items().is_empty()
+            && self.queue.items().iter().all(indexed)
+    }
+
     /// Shuffles the queue (`shuffleQueue`): the playing song to the head, the rest drawn from `seed`.
     pub fn shuffle(&mut self, seed: u64) -> bool {
         self.prefetch_dirty = true;
@@ -277,10 +420,10 @@ impl Playback {
         self.queue.shuffle(seed)
     }
 
-    /// `clearQueue`: every queued item except the playing one leaves; the player keeps running.
+    /// Clears the editable list without stopping the active audio request.
     pub fn clear_queue(&mut self) -> bool {
         self.prefetch_dirty = true;
-        let cleared = self.queue.clear_except_current();
+        let cleared = !self.is_fm() && self.queue.clear_list();
         if cleared {
             self.failures = 0;
         }
@@ -289,6 +432,13 @@ impl Playback {
 
     /// Empties the queue and stops, as signing out of the active platform does (`resetForProviderSwitch`).
     pub fn clear(&mut self) {
+        self.listen = ListenTracker::default();
+        self.listened_track = None;
+        self.report_task = None;
+        self.restored = None;
+        self.start_position = 0.0;
+        self.lyrics_pending = false;
+        self.queue_ended = false;
         self.active_input = None;
         self.failed_inputs.clear();
         self.audio_task = None;
@@ -309,7 +459,42 @@ impl Playback {
         self.refresh();
     }
 
+    /// Applies an audio-source policy change without accepting requests started under the previous policy.
+    pub fn source_mode_changed(&mut self) -> Task<Message> {
+        self.prefetch_task = None;
+        self.prefetch_dirty = true;
+        self.failed_inputs.clear();
+        if self.restored.is_some() {
+            if self.loading.active() {
+                self.audio_task = None;
+                self.end_loading();
+                self.loading_toast = false;
+                self.request = self.request.wrapping_add(1);
+                self.lyrics_pending = false;
+            }
+            self.notice = None;
+            self.notice_serial = self.notice_serial.wrapping_add(1);
+            return Task::none();
+        }
+        let stop = if self.current().is_some_and(|track| track.online.is_some()) {
+            self.active_input = None;
+            self.lyrics_pending = false;
+            self.topping_up = false;
+            self.seeking = None;
+            self.failures = 0;
+            self.notice = None;
+            self.notice_serial = self.notice_serial.wrapping_add(1);
+            self.stop_current()
+        } else {
+            Task::none()
+        };
+        Task::batch([stop, self.refresh_prefetch()])
+    }
+
     pub fn update(&mut self, message: Message, store: &Store) -> Task<Message> {
+        if self.cache_pause.is_some() && !matches!(message, Message::Reported(_)) {
+            return Task::none();
+        }
         if matches!(
             &message,
             Message::CycleRepeat
@@ -322,9 +507,42 @@ impl Playback {
             self.prefetch_dirty = true;
         }
         match message {
+            Message::Scrobble(enabled) => {
+                if enabled && !self.omni.as_ref().is_some_and(|omni| omni.playback_reporting_ready("netease")) {
+                    return Task::none();
+                }
+                self.settings.netease_scrobble_enabled = enabled;
+                self.listen = ListenTracker::default();
+                self.listened_track = None;
+                if !enabled {
+                    self.report_task = None;
+                }
+                save(store, &self.settings)
+            }
+            Message::Reported(serial) => {
+                if serial == self.report_serial {
+                    self.report_task = None;
+                }
+                Task::none()
+            }
+            Message::Media(command) => self.media_command(command, store),
             Message::Toggle => {
+                self.listen.discontinuity();
                 if self.loading.active() {
                     return Task::none();
+                }
+                if let Some((id, position)) = self.restored.take() {
+                    self.failures = 0;
+                    self.failure_forward = true;
+                    self.failed_inputs.clear();
+                    let position = if self.current().is_some_and(|track| track.id == id)
+                        && (self.duration() <= 0.0 || position < self.duration())
+                    {
+                        position
+                    } else {
+                        0.0
+                    };
+                    return self.load_current_at(position);
                 }
                 match self.status.state {
                     PlayerState::Playing => self.with_player(Player::pause),
@@ -345,6 +563,15 @@ impl Playback {
                 Task::none()
             }
             Message::SeekDone => {
+                self.listen.discontinuity();
+                self.seek_revision = self.seek_revision.wrapping_add(1);
+                if let Some((_, restored)) = self.restored.as_mut() {
+                    if let Some(position) = self.seeking.take() {
+                        *restored = if position.is_finite() { position.max(0.0) } else { 0.0 };
+                        self.status.position = *restored;
+                    }
+                    return Task::none();
+                }
                 if let (Some(position), Some(player)) = (self.seeking.take(), &self.player) {
                     player.seek(position);
                 }
@@ -353,7 +580,7 @@ impl Playback {
             }
             Message::Volume(volume) => {
                 self.settings.volume = volume;
-                self.muted = false;
+                self.settings.muted = false;
                 self.apply_gain();
                 Task::none()
             }
@@ -362,9 +589,9 @@ impl Playback {
                 Task::none()
             }
             Message::ToggleMute => {
-                self.muted = !self.muted;
+                self.settings.muted = !self.settings.muted;
                 self.apply_gain();
-                Task::none()
+                save(store, &self.settings)
             }
             Message::VolumeDone => save(store, &self.settings),
             Message::CycleRepeat => {
@@ -412,6 +639,7 @@ impl Playback {
             Message::LyricsLoaded(request, id, lyrics, kept) => {
                 if request == self.request && self.current().is_some_and(|track| track.id == id) {
                     self.lyrics = lyrics;
+                    self.lyrics_pending = false;
                     self.kept_chorus = kept.map(|ranges| (id, ranges));
                 }
                 Task::none()
@@ -437,13 +665,14 @@ impl Playback {
                 let Some(track) = self.queue.current_mut().filter(|track| track.id == id) else { return Task::none() };
                 match result {
                     Ok(input) => {
+                        self.restored = None;
                         self.active_input = Some(input.clone());
                         if input.download.is_none() {
                             self.loading_toast = false;
                         }
                         track.path = input.path.clone();
                         self.loading.decoding(request);
-                        self.with_player(|player| player.load_input(input.clone()));
+                        self.with_player(|player| player.load_input_at(input.clone(), self.start_position));
                         self.refresh();
                         Task::done(Message::Started(request))
                     }
@@ -453,13 +682,16 @@ impl Playback {
                         self.refresh();
                         self.end_loading();
                         self.loading_toast = false;
-                        self.notice_serial = self.notice_serial.wrapping_add(1);
-                        let serial = self.notice_serial;
-                        self.notice = provider.map(|provider| (provider, Instant::now()));
                         tracing::info!("online playback stopped: subscription required");
-                        Task::perform(blocking(|| std::thread::sleep(Duration::from_secs(6))), move |_| {
-                            Message::NoticeLeaving(serial)
-                        })
+                        provider.map_or_else(Task::none, |provider| self.show_notice(Notice::Subscription(provider)))
+                    }
+                    Err(AudioFailure::CustomSourceUnavailable) => {
+                        self.active_input = None;
+                        self.lyrics_pending = false;
+                        self.topping_up = false;
+                        tracing::info!("online playback stopped: custom sources unavailable");
+                        let stopped = self.stop_current();
+                        Task::batch([stopped, self.show_notice(Notice::CustomSourceUnavailable)])
                     }
                     Err(AudioFailure::Other(err)) => {
                         tracing::warn!(track = %track.display_name(), error = %err, "online track unavailable");
@@ -487,8 +719,72 @@ impl Playback {
         }
     }
 
+    fn media_command(&mut self, command: folia_media::Command, store: &Store) -> Task<Message> {
+        use folia_media::Command;
+        match command {
+            Command::Raise => Task::none(),
+            Command::Play if !self.is_playing() => self.update(Message::Toggle, store),
+            Command::Pause if self.loading.active() => {
+                let position = self.heard_position();
+                let task = self.media_stop();
+                if let Some(track) = self.current() {
+                    self.restored = Some((track.id, position));
+                    self.status = Status { state: PlayerState::Paused, position, duration: self.duration() };
+                }
+                task
+            }
+            Command::Pause if self.is_playing() => self.update(Message::Toggle, store),
+            Command::Play | Command::Pause => Task::none(),
+            Command::PlayPause => {
+                let command = if self.is_playing() || self.loading.active() { Command::Pause } else { Command::Play };
+                self.media_command(command, store)
+            }
+            Command::Stop => self.media_stop(),
+            Command::Next | Command::Previous => {
+                let forward = command == Command::Next;
+                if self.is_playing() || self.loading.active() {
+                    return self.skip(forward);
+                }
+                let state =
+                    if self.status.state == PlayerState::Paused { PlayerState::Paused } else { PlayerState::Idle };
+                let selected = if forward { self.queue.advance(false) } else { self.queue.back() };
+                let Some(track) = selected.cloned() else { return Task::none() };
+                let stop = self.media_stop();
+                self.restored = Some((track.id, 0.0));
+                self.status = Status { state, position: 0.0, duration: track.duration };
+                self.lyrics = None;
+                self.lyric_offset = 0.0;
+                self.lyrics_pending = true;
+                Task::batch([stop, self.read_lyrics(&track, self.request)])
+            }
+            Command::Volume(value) if value.is_finite() => {
+                let change = self.update(Message::Volume(value.clamp(0.0, 1.0) as f32), store);
+                Task::batch([change, self.update(Message::VolumeDone, store)])
+            }
+            Command::Volume(_) => Task::none(),
+        }
+    }
+
+    fn media_stop(&mut self) -> Task<Message> {
+        let duration = self.duration();
+        self.restored = None;
+        self.start_position = 0.0;
+        self.seeking = None;
+        self.topping_up = false;
+        self.lyrics_pending = false;
+        self.active_input = None;
+        self.prefetch_task = None;
+        let task = self.stop_current();
+        self.status = Status { state: PlayerState::Idle, position: 0.0, duration };
+        task
+    }
+
     fn tick(&mut self) -> Task<Message> {
         self.refresh();
+        self.observe_listen();
+        if self.status.state == PlayerState::Playing && !self.is_buffering() {
+            self.start_position = 0.0;
+        }
         if self.status.position > 0.0 {
             self.failures = 0;
         }
@@ -498,7 +794,7 @@ impl Playback {
         {
             self.failed_inputs.push(input.path);
             tracing::warn!(request = self.request, "audio stream failed; continuing source fallback");
-            return self.load_current();
+            return self.load_current_at(self.start_position);
         }
         if self.loading.phase == LoadPhase::Decoding
             && ((self.status.position > 0.0 && !self.player.as_ref().is_some_and(Player::is_buffering))
@@ -524,21 +820,23 @@ impl Playback {
     }
 
     fn skip(&mut self, forward: bool) -> Task<Message> {
+        self.failures = 0;
         if forward {
             return self.advance(false);
         }
-        if self.queue.back().is_some() { self.start_current() } else { Task::none() }
+        if self.queue.back().is_some() { self.start_current_in_direction(false) } else { Task::none() }
     }
 
     fn fail(&mut self) -> Task<Message> {
         self.failures += 1;
         if self.failures >= self.queue.items().len() {
             self.failures = 0;
-            self.with_player(Player::stop);
-            self.refresh();
-            return Task::none();
+            return self.stop_current();
         }
-        self.advance(false)
+        if self.failure_forward {
+            return self.advance(false);
+        }
+        if self.queue.back().is_some() { self.start_current_in_direction(false) } else { self.stop_current() }
     }
 
     fn advance(&mut self, finished: bool) -> Task<Message> {
@@ -561,24 +859,86 @@ impl Playback {
 
     fn step(&mut self, finished: bool) -> Task<Message> {
         if self.queue.advance(finished).is_some() {
-            return self.start_current();
+            return self.start_current_in_direction(true);
         }
+        self.queue_ended |= finished;
+        self.stop_current()
+    }
+
+    fn stop_current(&mut self) -> Task<Message> {
+        let report = self.settle_listen();
         self.audio_task = None;
         self.end_loading();
         self.loading_toast = false;
         self.request = self.request.wrapping_add(1);
         self.with_player(Player::stop);
         self.refresh();
-        Task::none()
+        report
     }
 
-    /// Starts a fresh request, discarding only the previous play's source failures.
+    /// An explicit selection begins a new forward failure traversal.
     fn start_current(&mut self) -> Task<Message> {
-        self.failed_inputs.clear();
-        self.load_current()
+        self.failures = 0;
+        self.start_current_in_direction(true)
     }
 
-    fn load_current(&mut self) -> Task<Message> {
+    /// Advances within a traversal while retaining its consecutive failure budget.
+    fn start_current_in_direction(&mut self, forward: bool) -> Task<Message> {
+        let report = self.settle_listen();
+        self.failure_forward = forward;
+        self.failed_inputs.clear();
+        Task::batch([report, self.load_current_at(0.0)])
+    }
+
+    fn observe_listen(&mut self) {
+        if !self.settings.netease_scrobble_enabled {
+            return;
+        }
+        let playing = self.is_playing() && !self.is_buffering() && self.restored.is_none();
+        if self.listened_track.is_none()
+            && playing
+            && let (Some(track), Some(omni)) = (self.current(), &self.omni)
+            && omni.can_report_playback(track)
+            && omni.playback_reporting_ready("netease")
+        {
+            self.listened_track = Some((track.clone(), self.settings.audio_quality));
+        }
+        if let Some((track, _)) = self.listened_track.as_mut() {
+            if self.status.duration > 0.0 {
+                track.duration = self.status.duration;
+            }
+            self.listen.observe(self.status.position, Instant::now(), playing);
+        }
+    }
+
+    fn settle_listen(&mut self) -> Task<Message> {
+        let Some((track, quality)) = self.listened_track.take() else { return Task::none() };
+        let seconds = self.listen.settle(track.duration);
+        let (Some(played_seconds), Some(omni)) = (seconds, self.omni.clone()) else { return Task::none() };
+        if !self.settings.netease_scrobble_enabled || self.report_task.is_some() {
+            return Task::none();
+        }
+        let report = folia_omni::PlaybackReport { played_seconds, total_seconds: track.duration, quality };
+        self.report_serial = self.report_serial.wrapping_add(1);
+        let serial = self.report_serial;
+        let (task, handle) = Task::perform(
+            async move {
+                if let Err(error) = omni.report_playback(&track, report).await {
+                    tracing::warn!(error = &error as &dyn std::error::Error, "listening report failed");
+                }
+            },
+            move |()| Message::Reported(serial),
+        )
+        .abortable();
+        self.report_task = Some(handle.abort_on_drop());
+        task
+    }
+
+    fn load_current_at(&mut self, position: f64) -> Task<Message> {
+        self.restored = None;
+        self.start_position = if position.is_finite() { position.max(0.0) } else { 0.0 };
+        self.lyrics_pending = false;
+        self.queue_ended = false;
         self.active_input = None;
         self.prefetch_dirty = true;
         self.audio_task = None;
@@ -593,6 +953,7 @@ impl Playback {
         };
         self.request = self.request.wrapping_add(1);
         let request = self.request;
+        self.lyrics_pending = true;
         // A track started any other way overtakes a personal FM batch on its way.
         self.topping_up = false;
         self.notice = None;
@@ -604,36 +965,23 @@ impl Playback {
         self.apply_gain();
         tracing::info!(track = %track.display_name(), "playing");
         let id = track.id;
-        let kept = self.kept_chorus.as_ref().filter(|(song, _)| *song == id).map(|(_, ranges)| ranges.clone());
-        let (Some(online), Some(omni)) = (track.online.clone(), self.omni.clone()) else {
-            self.with_player(|player| player.load(&track.path));
+        let lyrics = self.read_lyrics(&track, request);
+        let (Some(_), Some(omni)) = (track.online.clone(), self.omni.clone()) else {
+            self.with_player(|player| player.load_input_at(track.path.clone().into(), self.start_position));
             self.refresh();
-            let lyrics = Task::perform(
-                blocking(move || settle_chorus(folia_library::lyrics_for(&track.path), kept)),
-                move |settled| {
-                    let (lyrics, kept) = settled.unwrap_or_default();
-                    Message::LyricsLoaded(request, id, lyrics, kept)
-                },
-            );
             return Task::batch([lyrics, Task::done(Message::Started(request))]);
         };
 
+        if self.start_position > 0.0 {
+            self.restored = Some((id, self.start_position));
+            self.status =
+                Status { state: PlayerState::Paused, position: self.start_position, duration: track.duration };
+        }
         self.with_player(Player::stop);
         self.refresh();
         self.loading.begin(request);
         self.loading_at = Some(Instant::now());
         self.loading_toast = !omni.audio_is_prefetched(&track, self.settings.audio_quality);
-        let (lyrics_omni, lyrics_id) = (omni.clone(), online.clone());
-        let lyrics = Task::perform(
-            async move {
-                let lyrics = lyrics_omni.lyrics(&lyrics_id).await.unwrap_or_else(|err| {
-                    tracing::warn!(error = &err as &dyn std::error::Error, "online lyrics unavailable");
-                    None
-                });
-                settle_chorus(lyrics, kept)
-            },
-            move |(lyrics, kept)| Message::LyricsLoaded(request, id, lyrics, kept),
-        );
         let quality = self.settings.audio_quality;
         let failed = self.failed_inputs.clone();
         let audio = Task::perform(
@@ -644,6 +992,7 @@ impl Playback {
                     id,
                     result.map_err(|err| match err {
                         folia_omni::OmniError::SubscriptionRequired => AudioFailure::SubscriptionRequired,
+                        folia_omni::OmniError::CustomSourceUnavailable => AudioFailure::CustomSourceUnavailable,
                         err => AudioFailure::Other(error_chain(&err)),
                     }),
                 )
@@ -654,6 +1003,28 @@ impl Playback {
         Task::batch([audio, lyrics])
     }
 
+    fn read_lyrics(&self, track: &Track, request: u64) -> Task<Message> {
+        let id = track.id;
+        let kept = self.kept_chorus.as_ref().filter(|(song, _)| *song == id).map(|(_, ranges)| ranges.clone());
+        if let (Some(online), Some(omni)) = (track.online.clone(), self.omni.clone()) {
+            return Task::perform(
+                async move {
+                    let lyrics = omni.lyrics(&online).await.unwrap_or_else(|err| {
+                        tracing::warn!(error = &err as &dyn std::error::Error, "online lyrics unavailable");
+                        None
+                    });
+                    settle_chorus(lyrics, kept)
+                },
+                move |(lyrics, kept)| Message::LyricsLoaded(request, id, lyrics, kept),
+            );
+        }
+        let path = track.path.clone();
+        Task::perform(blocking(move || settle_chorus(folia_library::lyrics_for(&path), kept)), move |settled| {
+            let (lyrics, kept) = settled.unwrap_or_default();
+            Message::LyricsLoaded(request, id, lyrics, kept)
+        })
+    }
+
     pub fn notice_animating(&self, now: Instant) -> bool {
         self.notice.as_ref().is_some_and(|(_, started)| {
             let ms = now.saturating_duration_since(*started).as_millis();
@@ -662,15 +1033,30 @@ impl Playback {
     }
 
     pub fn subscription_notice(&self, now: Instant) -> Option<(&str, f32, f32)> {
-        let (provider, started) = self.notice.as_ref()?;
-        let ms = now.saturating_duration_since(*started).as_secs_f64() * 1000.0;
-        let entered = folia_visualizer::Ease::new(0.2, 0.8, 0.2, 1.0).at((ms / 320.0).clamp(0.0, 1.0)) as f32;
-        let left = folia_visualizer::Ease::new(0.4, 0.0, 1.0, 1.0).at(((ms - 6000.0) / 220.0).clamp(0.0, 1.0)) as f32;
-        Some((provider, entered * (1.0 - left), -18.0 * (1.0 - entered) - 10.0 * left))
+        let (Notice::Subscription(provider), started) = self.notice.as_ref()? else { return None };
+        let (opacity, shift) = notice_frame(*started, now);
+        Some((provider, opacity, shift))
+    }
+
+    pub fn custom_source_notice(&self, now: Instant) -> Option<(f32, f32)> {
+        let (Notice::CustomSourceUnavailable, started) = self.notice.as_ref()? else { return None };
+        Some(notice_frame(*started, now))
+    }
+
+    fn show_notice(&mut self, notice: Notice) -> Task<Message> {
+        self.notice_serial = self.notice_serial.wrapping_add(1);
+        let serial = self.notice_serial;
+        self.notice = Some((notice, Instant::now()));
+        Task::perform(blocking(|| std::thread::sleep(Duration::from_secs(6))), move |_| Message::NoticeLeaving(serial))
     }
 
     fn refresh(&mut self) {
-        if let Some(player) = &self.player {
+        if self.restored.is_some_and(|(id, _)| self.current().is_some_and(|track| track.id == id)) {
+            return;
+        }
+        self.restored = None;
+        if let Some(player) = &mut self.player {
+            player.collect_room();
             self.status = player.status();
         }
     }
@@ -679,6 +1065,38 @@ impl Playback {
         if let Some(player) = &self.player {
             action(player);
         }
+    }
+
+    pub(crate) fn shutdown(&mut self) {
+        self.audio_task = None;
+        self.prefetch_task = None;
+        self.request = self.request.wrapping_add(1);
+        self.with_player(Player::stop);
+    }
+
+    pub(crate) fn suspend_cache(&mut self) -> Option<std::sync::mpsc::Receiver<()>> {
+        let position = self.heard_position();
+        let state = self.status.state;
+        let playing = self.is_playing() || self.loading.active();
+        self.request = self.request.wrapping_add(1);
+        self.cache_pause = Some((self.request, playing));
+        self.audio_task = None;
+        self.prefetch_task = None;
+        self.prefetch_dirty = false;
+        self.active_input = None;
+        self.failed_inputs.clear();
+        self.end_loading();
+        self.listen.discontinuity();
+        self.restored = self.current().map(|track| (track.id, position));
+        self.status.position = position;
+        self.status.state = if playing { PlayerState::Paused } else { state };
+        self.player.as_ref().map(Player::stop_and_release)
+    }
+
+    pub(crate) fn resume_cache(&mut self, store: &Store, resume: bool) -> Task<Message> {
+        let Some((request, playing)) = self.cache_pause.take() else { return Task::none() };
+        self.prefetch_dirty = true;
+        if request == self.request && playing && resume { self.update(Message::Toggle, store) } else { Task::none() }
     }
 
     fn end_loading(&mut self) {
@@ -708,6 +1126,13 @@ impl Playback {
 
     /// Queue edits, shuffle, FM refill, quality and current-track changes all reach this single hook.
     pub fn refresh_prefetch(&mut self) -> Task<Message> {
+        if self.cache_pause.is_some() {
+            return Task::none();
+        }
+        if self.restored.is_some() {
+            self.prefetch_task = None;
+            return Task::none();
+        }
         let revision = self.omni.as_ref().map_or(0, Omni::audio_cache_revision);
         self.prefetch_dirty |= revision != self.source_revision;
         self.source_revision = revision;
@@ -742,6 +1167,13 @@ impl Playback {
         self.prefetch_task = Some(handle.abort_on_drop());
         task
     }
+}
+
+fn notice_frame(started: Instant, now: Instant) -> (f32, f32) {
+    let ms = now.saturating_duration_since(started).as_secs_f64() * 1000.0;
+    let entered = folia_visualizer::Ease::new(0.2, 0.8, 0.2, 1.0).at((ms / 320.0).clamp(0.0, 1.0)) as f32;
+    let left = folia_visualizer::Ease::new(0.4, 0.0, 1.0, 1.0).at(((ms - 6000.0) / 220.0).clamp(0.0, 1.0)) as f32;
+    (entered * (1.0 - left), -18.0 * (1.0 - entered) - 10.0 * left)
 }
 
 /// Request-scoped loading state prevents an old completion from clearing a newer song's indicator.

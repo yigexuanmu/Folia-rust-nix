@@ -6,7 +6,8 @@ mod playlists;
 mod tags;
 
 pub use cover::{
-    Cover, CoverCache, cached_cover_thumbnail, cover_bytes, cover_for, cover_rgba, cover_uncropped, has_cover,
+    Cover, CoverCache, cached_cover_thumbnail, cover_and_background, cover_bytes, cover_for, cover_rgba,
+    cover_uncropped, has_cover,
 };
 pub use lyrics::{decode_text, lyrics_for};
 pub use playlists::Playlist;
@@ -267,6 +268,15 @@ impl Library {
 
     pub fn create_playlist(&self, name: &str) -> Result<Playlist, LibraryError> {
         playlists::create(&self.conn, name)
+    }
+
+    /// Creates a named playlist and commits its ordered local tracks together.
+    pub fn save_queue(&mut self, name: &str, tracks: &[i64]) -> Result<(), LibraryError> {
+        let tx = self.conn.transaction()?;
+        let playlist = playlists::create(&tx, name)?;
+        playlists::add(&tx, playlist.id, tracks)?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// The liked-songs list, created on first use (`getFavoriteLocalPlaylist`).

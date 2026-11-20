@@ -66,6 +66,10 @@ pub(crate) struct AudioCache {
     revision: std::sync::atomic::AtomicU64,
 }
 impl AudioCache {
+    pub(crate) fn clear(&self) {
+        self.entries.lock().clear();
+        self.invalidate();
+    }
     pub(crate) fn invalidate(&self) {
         self.revision.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     }
@@ -108,7 +112,9 @@ impl Omni {
                 keys.push(format!("{stem}-lx-{id}-{}", quality.id()));
             }
         }
-        keys.push(format!("{stem}-{}", resolve_quality(provider.audio_quality_levels(), quality).id()));
+        if !self.sources.custom_only() {
+            keys.push(format!("{stem}-{}", resolve_quality(provider.audio_quality_levels(), quality).id()));
+        }
         let entries = self.audio_cache.entries.lock();
         keys.iter().any(|key| {
             entries.iter().find(|(name, _)| name == key).is_some_and(|(_, entry)| {
@@ -137,10 +143,17 @@ impl Omni {
     }
     /// Resolves the original lightweight prefetch window sequentially; dropping the future cancels the pass.
     pub async fn prefetch(&self, plan: PrefetchPlan) {
+        let revision = self.audio_cache_revision();
         for track in &plan.tracks {
             tokio::time::sleep(Duration::from_millis(100)).await;
+            if self.audio_cache_revision() != revision {
+                return;
+            }
             if let Err(err) = self.track_input(track, plan.quality, Load::Prefetch, &[]).await {
                 tracing::debug!(error = &err as &dyn std::error::Error, "audio prefetch unavailable");
+            }
+            if self.audio_cache_revision() != revision {
+                return;
             }
             if let Some(song) = &track.online
                 && let Err(err) = self.lyrics(song).await
@@ -162,12 +175,33 @@ impl Omni {
         preference: AudioQuality,
         failed: &[PathBuf],
     ) -> Result<AudioInput, OmniError> {
-        self.track_input(track, preference, Load::Stream, failed).await
+        self.read_track_input(track, preference, Load::Stream, failed).await
     }
 
     /// Compatibility for callers that need the complete file, including platform downloads.
     pub async fn fetch_track_audio(&self, track: &Track, preference: AudioQuality) -> Result<PathBuf, OmniError> {
-        Ok(self.track_input(track, preference, Load::Complete, &[]).await?.path)
+        Ok(self.read_track_input(track, preference, Load::Complete, &[]).await?.path)
+    }
+
+    async fn read_track_input(
+        &self,
+        track: &Track,
+        quality: AudioQuality,
+        load: Load,
+        failed: &[PathBuf],
+    ) -> Result<AudioInput, OmniError> {
+        loop {
+            let mut access = self.cache.read().await?;
+            let result = tokio::select! {
+                biased;
+                _ = access.changed.changed() => continue,
+                result = self.track_input(track, quality, load, failed) => result,
+            };
+            if matches!(result, Err(OmniError::CacheMoving)) {
+                continue;
+            }
+            return result;
+        }
     }
 
     async fn track_input(
@@ -179,7 +213,6 @@ impl Omni {
     ) -> Result<AudioInput, OmniError> {
         let song = track.online.as_ref().ok_or(OmniError::Unavailable)?;
         let provider = self.provider(&song.provider)?;
-        let level = resolve_quality(provider.audio_quality_levels(), preference);
         let stem = format!("{}-{}", song.provider, song.id);
         if let Some(info) = provider.lx_music_info(track) {
             for (id, script) in self.sources.active(info.source) {
@@ -200,11 +233,28 @@ impl Omni {
                 }
             }
         }
+        self.allow_native_audio()?;
+        let result = self.platform_track_input(track, song, preference, load, failed).await;
+        self.allow_native_audio()?;
+        result
+    }
+
+    async fn platform_track_input(
+        &self,
+        track: &Track,
+        song: &folia_core::OnlineId,
+        preference: AudioQuality,
+        load: Load,
+        failed: &[PathBuf],
+    ) -> Result<AudioInput, OmniError> {
+        let provider = self.provider(&song.provider)?;
+        let level = resolve_quality(provider.audio_quality_levels(), preference);
+        let stem = format!("{}-{}", song.provider, song.id);
         let key = format!("{stem}-{}", level.id());
         if failed_key(failed, &key) || failed_key(failed, &stem) {
             return Err(OmniError::Unavailable);
         }
-        let dir = self.cache_dir.join("audio");
+        let dir = self.cache.path().join("audio");
         if let Some(path) = cached_file(&dir, &key).or_else(|| cached_file(&dir, &stem)) {
             return Ok(path.into());
         }
@@ -237,7 +287,7 @@ impl Omni {
         load: Load,
     ) -> Result<AudioInput, OmniError> {
         let started = Instant::now();
-        let dir = self.cache_dir.join("audio");
+        let dir = self.cache.path().join("audio");
         let shared = self.audio_cache.entry(key);
         let mut entry = shared.lock().await;
         if let Some(path) = cached_file(&dir, key) {
@@ -299,7 +349,8 @@ impl Omni {
     async fn download(&self, key: &str, source: &AudioSource, started: Instant) -> Result<AudioInput, OmniError> {
         validate_extension(&source.extension)?;
         let name = if source.preview { format!("{key}-preview") } else { key.to_owned() };
-        let dir = self.cache_dir.join("audio");
+        let mut access = self.cache.writer()?;
+        let dir = access.path.join("audio");
         let path = dir.join(format!("{name}.{}", source.extension));
         let io_err = |source| OmniError::Io { path: path.clone(), source };
         std::fs::create_dir_all(&dir).map_err(io_err)?;
@@ -321,7 +372,11 @@ impl Omni {
         let input = AudioInput { path: path.clone(), download: Some(download.clone()) };
         let key = key.to_owned();
         tokio::spawn(async move {
-            let result = write_download(response, writer, &download, &key, &path, started, deadline).await;
+            let result = tokio::select! {
+                biased;
+                _ = access.changed.changed() => Err(OmniError::CacheMoving),
+                result = write_download(response, writer, &download, &key, &path, started, deadline) => result,
+            };
             if let Some(ranges) = ranges {
                 ranges.abort();
                 if let Err(err) = ranges.await
@@ -334,12 +389,17 @@ impl Omni {
                 std::fs::rename(&partial, &path).map_err(|source| OmniError::Io { path: path.clone(), source })
             });
             if let Err(error) = &result {
-                tracing::error!(song = key, error = error as &dyn std::error::Error, "audio download failed");
+                if matches!(error, OmniError::CacheMoving) {
+                    tracing::debug!(song = key, "audio download cancelled for cache relocation");
+                } else {
+                    tracing::error!(song = key, error = error as &dyn std::error::Error, "audio download failed");
+                }
                 if let Err(err) = std::fs::remove_file(&partial) {
                     tracing::warn!(error = &err as &dyn std::error::Error, "cannot remove incomplete audio");
                 }
             }
             download.finish(result.map_err(|error| folia_store::error_chain(&error)));
+            drop(access);
         });
         Ok(input)
     }

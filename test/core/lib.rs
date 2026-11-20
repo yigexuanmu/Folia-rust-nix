@@ -5,6 +5,21 @@
 use folia_core::{Language, LanguagePreference, Origin, Queue, Repeat};
 
 #[test]
+fn online_credits_preserve_legacy_metadata_and_exact_artist_order() {
+    use folia_core::{ArtistRef, OnlineTrackInfo};
+    let old: OnlineTrackInfo = toml::from_str("album_id = \"album-mid\"\naudio_id = \"audio\"\n").unwrap();
+    assert!(old.artists.is_empty());
+    assert_eq!(old.album_id, "album-mid");
+    let mut current = old;
+    current.artists = vec![
+        ArtistRef { id: "artist-2".into(), name: "AC/DC, Live".into() },
+        ArtistRef { id: "artist-1".into(), name: "AC/DC, Live".into() },
+    ];
+    let restored: OnlineTrackInfo = toml::from_str(&toml::to_string(&current).unwrap()).unwrap();
+    assert_eq!(restored, current);
+}
+
+#[test]
 fn keyword_colors_match_phrases_and_whole_latin_words() {
     use folia_core::{WordColor, word_color_ranges};
     let colors = vec![
@@ -104,6 +119,28 @@ fn queue_origin_lasts_until_the_queue_is_replaced() {
 }
 
 #[test]
+fn queue_snapshots_keep_order_selection_and_detached_items() {
+    let mut queue = Queue::default();
+    queue.replace_from(vec!['a', 'b', 'a'], 2, Origin { name: "Source".into() });
+    let mut restored = Queue::default();
+    restored.repeat = Repeat::All;
+    restored.restore(queue.snapshot());
+    assert_eq!(restored.snapshot(), queue.snapshot());
+    assert_eq!(restored.repeat, Repeat::All);
+    queue.clear_list();
+    restored.restore(queue.snapshot());
+    assert_eq!(restored.current(), Some(&'a'));
+    assert!(restored.items().is_empty());
+    let mut invalid = queue.snapshot();
+    invalid.items = vec!['b'];
+    invalid.current = Some(99);
+    restored.restore(invalid);
+    assert_eq!(restored.current_index(), None);
+    assert_eq!(restored.current(), Some(&'a'));
+    assert_eq!(restored.advance(false), Some(&'b'));
+}
+
+#[test]
 fn clearing_the_queue_keeps_the_current_item_playing() {
     let mut queue = Queue::default();
     queue.replace_from(vec!['a', 'b', 'c', 'd'], 2, Origin { name: "全部歌曲".to_owned() });
@@ -116,6 +153,14 @@ fn clearing_the_queue_keeps_the_current_item_playing() {
 
     let mut empty = Queue::<char>::default();
     assert!(!empty.clear_except_current());
+
+    let mut detached = folia_core::Queue::default();
+    detached.replace(vec![1, 2, 3], 1);
+    assert!(detached.clear_list());
+    assert_eq!((detached.items().len(), detached.current_index(), detached.current()), (0, None, Some(&2)));
+    assert!(!detached.clear_list());
+    assert_eq!(detached.append(vec![2, 4, 5], |a, b| a == b), 2);
+    assert_eq!(detached.advance(false), Some(&4));
     assert!(empty.items().is_empty());
 }
 
@@ -166,4 +211,33 @@ fn shuffle_keeps_the_playing_song_and_repeats_with_the_same_seed() {
     let mut single = only_one;
     single.replace(vec![7], 0);
     assert!(!single.shuffle(9));
+    let mut waiting = folia_core::Queue::default();
+    waiting.append(vec![1, 2, 3, 4], |a, b| a == b);
+    assert!(waiting.shuffle(9));
+    assert_eq!(waiting.current(), None);
+    let mut songs = waiting.items().to_vec();
+    songs.sort_unstable();
+    assert_eq!(songs, [1, 2, 3, 4]);
+}
+
+#[test]
+fn lyric_quality_preserves_density_and_resolves_partial_overrides() {
+    use folia_core::{LyricAntialias, LyricRenderOverride, LyricRenderQuality};
+    assert_eq!(toml::from_str::<LyricRenderQuality>("").unwrap(), LyricRenderQuality::default());
+    for (base, scale, expected) in
+        [(1.0, 0.5, 0.5), (2.0, 0.75, 1.5), (2.0, 1.0, 2.0), (2.0, 1.5, 3.0), (2.0, 2.0, 3.0), (4.0, 2.0, 4.0)]
+    {
+        assert_eq!(LyricRenderQuality { scale, ..Default::default() }.pixel_ratio(base), expected);
+    }
+    let global = LyricRenderQuality { scale: 0.75, antialias: LyricAntialias::On };
+    assert_eq!(LyricRenderOverride::default().resolve(global), global);
+    assert_eq!(LyricRenderOverride { scale: None, antialias: Some(LyricAntialias::Auto) }.resolve(global), global);
+    assert_eq!(
+        LyricRenderOverride { scale: Some(2.0), antialias: None }.resolve(global),
+        LyricRenderQuality { scale: 2.0, ..global }
+    );
+    assert_eq!(
+        LyricRenderOverride { scale: Some(f32::NAN), antialias: Some(LyricAntialias::Off) }.resolve(global),
+        LyricRenderQuality { antialias: LyricAntialias::Off, ..global }
+    );
 }

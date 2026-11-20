@@ -1,6 +1,8 @@
 // Home cover wall: the original Bravais wall of tiles, repeated without an edge, ranked when filtered, or laid in explore lots.
 
+use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, HashSet};
+use std::hash::{BuildHasher, DefaultHasher, Hash, Hasher};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -16,6 +18,9 @@ use crate::focus_card::{self, BlockShape, Focus, SlotId};
 use crate::lots::{self, LOT_COLS, LOT_ROWS, Lot};
 use crate::wall_pan::{self, Gesture, Glide, Inertia, Pointer, Release, WheelSource};
 use crate::wall_shift::{Kind, Pose, Shift};
+
+#[path = "radio_draw.rs"]
+pub(crate) mod radio_draw;
 
 const CELL: f32 = 128.0;
 /// Typeset labels are cheap, but every distinct (tile, width) pair once stayed here forever.
@@ -146,14 +151,15 @@ pub fn key_hue(key: &str) -> f32 {
 /// How the wall lays its tiles: repeated without an edge, ranked round the origin (filtered), or explore lots.
 pub enum Shape {
     Blocks,
+    Radio,
     Finite,
     Explore(Vec<lots::Section>),
 }
 
 enum Layout {
-    /// `getInfiniteSlotItem`: block slots in slot order over a period of whole blocks, rotated so `offset` is item 0.
+    /// `getInfiniteSlotItem`: repeated block slots rotated so `offset` is the first ordered tile.
     Blocks {
-        count: usize,
+        order: Vec<usize>,
         offset: usize,
         columns: i32,
         rows: i32,
@@ -270,9 +276,17 @@ pub struct CoverLayers<'a> {
 }
 
 pub struct Wall {
+    radio_departure: Option<Box<radio_draw::Departure>>,
+    hover: crate::wall_hover::Hover,
+    pub(crate) linked: Option<usize>,
+    pub(crate) appearance: folia_store::WallAppearance,
+    lights: crate::motion::Tween,
+    tint: crate::motion::Tween,
+    order_seed: Option<u64>,
     layout: Layout,
     /// The placements on screen, rebuilt in place whenever the camera, seam or layout moves.
     shown: Vec<Placement>,
+    empty_slots: Vec<(Rectangle, bool)>,
     /// Keyed by tile and the slot width it was fitted to: the edgeless wall shows one tile in slots of several sizes.
     labels: HashMap<(usize, u32), Label>,
     typeset: Option<Typeset>,
@@ -287,6 +301,8 @@ pub struct Wall {
     cover_retry: Option<(u64, Instant, iced::task::Handle)>,
     pending: HashMap<i64, CoverRequest>,
     next_cover_ticket: u64,
+    closed_ticket: u64,
+    suspended: bool,
     seam_open: f32,
     anchor_x: f32,
     anchor_y: f32,
@@ -321,6 +337,9 @@ struct Shade {
     /// An album mosaic's lighter foot, so the pieces read as one cover.
     mosaic: Handle,
     ground: Handle,
+    expanded_up: Handle,
+    expanded_side: Handle,
+    focus_glow: Handle,
     /// The shade's colour for what stays a filled shape: the grown card's bands, the mosaic copy's shadow.
     tint: Color,
 }
@@ -333,9 +352,33 @@ impl Shade {
             fade: shade_column(channel, &[(0.0, 0.05), (0.34, 0.05), (0.56, 0.24), (1.0, 0.92)]),
             mosaic: shade_column(channel, &[(0.0, 0.0), (0.55, 0.0), (0.74, 0.12), (1.0, 0.40)]),
             ground: Handle::from_rgba(1, 1, vec![channel, channel, channel, 255]),
+            expanded_up: shade_strip(channel, &focus_card::EXPANDED_SHADE, false, true),
+            expanded_side: shade_strip(channel, &focus_card::EXPANDED_SIDE, true, false),
+            focus_glow: shade_strip(255, &[(0.0, 0.1), (0.6, 0.0)], false, false),
             tint: Color::from_rgb8(channel, channel, channel),
         }
     }
+}
+
+/// Samples the same smooth interpolation as iced's canvas gradients, extending the final stop.
+fn shade_strip(channel: u8, stops: &[(f32, f32)], horizontal: bool, reversed: bool) -> Handle {
+    const SIDE: u32 = 1024;
+    let pixels = (0..SIDE)
+        .flat_map(|index| {
+            let t = (index as f32 + 0.5) / SIDE as f32;
+            let t = if reversed { 1.0 - t } else { t };
+            let alpha = stops.windows(2).find(|pair| t <= pair[1].0).map_or_else(
+                || stops.last().map_or(0.0, |(_, alpha)| *alpha),
+                |pair| {
+                    let ((start, a), (end, b)) = (pair[0], pair[1]);
+                    let p = ((t - start) / (end - start)).clamp(0.0, 1.0);
+                    a + (b - a) * p * p * (3.0 - 2.0 * p)
+                },
+            );
+            [channel, channel, channel, (alpha * 255.0).round() as u8]
+        })
+        .collect::<Vec<u8>>();
+    Handle::from_rgba(if horizontal { SIDE } else { 1 }, if horizontal { 1 } else { SIDE }, pixels)
 }
 
 /// A one-pixel-wide image whose alpha runs through `stops` (position, alpha) from top to bottom.
@@ -358,6 +401,7 @@ fn shade_column(channel: u8, stops: &[(f32, f32)]) -> Handle {
 
 /// A tile of the outgoing layer, kept to be drawn while it turns or lifts away.
 struct Ghost {
+    clear: bool,
     rect: Rectangle,
     index: usize,
     id: i64,
@@ -372,6 +416,13 @@ struct Ghost {
     stack: bool,
 }
 
+pub(crate) struct Handoff {
+    pub viewport: Size,
+    ghosts: Vec<Ghost>,
+    origin: Point,
+    radio: Option<Box<radio_draw::Departure>>,
+}
+
 impl Default for Wall {
     fn default() -> Self {
         Self::new()
@@ -379,10 +430,69 @@ impl Default for Wall {
 }
 
 impl Wall {
+    pub(crate) fn take_handoff(&mut self, tiles: &[Tile]) -> Handoff {
+        self.next_shift = None;
+        self.shift = None;
+        self.capture(tiles);
+        Handoff {
+            viewport: self.viewport,
+            ghosts: std::mem::take(&mut self.ghosts),
+            origin: Point::new(self.viewport.width / 2.0, self.viewport.height / 2.0),
+            radio: None,
+        }
+    }
+
+    pub(crate) fn accept_handoff(&mut self, handoff: Handoff, tiles: &[Tile]) {
+        self.radio_departure = handoff.radio;
+        self.ghosts = handoff.ghosts;
+        self.shift = None;
+        self.next_shift = Some(Kind::Flip(handoff.origin));
+        self.start_shift(tiles);
+    }
+
+    pub(crate) fn begin_visit(&mut self, randomize: bool) {
+        self.set_order_seed(randomize.then(|| RandomState::new().hash_one(())));
+    }
+
+    /// Sets the ordering for subsequent layouts; the same seed keeps tile identities in the same order.
+    pub fn set_order_seed(&mut self, seed: Option<u64>) {
+        self.order_seed = seed;
+    }
+
+    pub fn order_seed(&self) -> Option<u64> {
+        self.order_seed
+    }
+
+    fn ordered_tiles(&self, tiles: &[Tile]) -> Vec<usize> {
+        let mut order: Vec<_> = (0..tiles.len()).collect();
+        if let Some(seed) = self.order_seed {
+            order.sort_by_cached_key(|&index| order_rank(seed, tiles[index].id));
+        }
+        order
+    }
+
     pub fn new() -> Self {
         Self {
+            radio_departure: None,
+            hover: Default::default(),
+            linked: None,
+            appearance: Default::default(),
+            lights: crate::motion::Tween::new(
+                0.0,
+                260.0,
+                folia_visualizer::Ease::new(0.25, 0.1, 0.25, 1.0),
+                Instant::now(),
+            ),
+            tint: crate::motion::Tween::new(
+                1.0,
+                260.0,
+                folia_visualizer::Ease::new(0.25, 0.1, 0.25, 1.0),
+                Instant::now(),
+            ),
+            order_seed: None,
             layout: Layout::Finite(Vec::new()),
             shown: Vec::new(),
+            empty_slots: Vec::new(),
             labels: HashMap::new(),
             typeset: None,
             viewport: Size::ZERO,
@@ -396,6 +506,8 @@ impl Wall {
             cover_retry: None,
             pending: HashMap::new(),
             next_cover_ticket: 0,
+            closed_ticket: 0,
+            suspended: false,
             seam_open: 0.0,
             anchor_x: SEAM_ANCHOR,
             anchor_y: SEAM_ANCHOR,
@@ -416,6 +528,72 @@ impl Wall {
         }
     }
 
+    pub(crate) fn set_suspended(&mut self, suspended: bool, tiles: &[Tile], omni: Option<&Omni>) -> Task<Message> {
+        if self.suspended == suspended {
+            return Task::none();
+        }
+        self.suspended = suspended;
+        if !suspended {
+            return self.show_visible(tiles, omni);
+        }
+        self.hover = Default::default();
+        self.closed_ticket = self.next_cover_ticket;
+        self.pending.clear();
+        self.cover_retry = None;
+        self.cover_allocations.clear();
+        self.cover_fades.clear();
+        self.covers.clear();
+        self.thumbnails.clear();
+        self.ghosts.clear();
+        self.shift = None;
+        self.inertia = None;
+        self.glide = None;
+        Task::none()
+    }
+
+    pub(crate) fn appearance(&mut self, next: folia_store::WallAppearance) {
+        self.appearance = next;
+        let now = Instant::now();
+        self.lights.set(if next.lights_on { 0.0 } else { 1.0 }, now);
+        self.tint.set(if next.tint && next.lights_on { 1.0 } else { 0.0 }, now);
+    }
+
+    fn depth(&self, slot: SlotId) -> u8 {
+        if self.focus.expanded().is_some_and(|(id, _)| id == slot) {
+            3
+        } else if self.focus.keyboard() == Some(slot) {
+            2
+        } else if self.hover.slot == Some(slot) {
+            1
+        } else {
+            0
+        }
+    }
+
+    fn hit(&self, at: iced::Point, now: Instant) -> Option<&Placement> {
+        let at = self.untilt(at, now);
+        self.shown.iter().filter(|p| self.drawn(p, now).contains(at)).max_by_key(|p| self.depth(p.slot))
+    }
+
+    pub(crate) fn pointer(&mut self, at: Option<iced::Point>, tiles: &[Tile], now: Instant) {
+        let slot = at
+            .and_then(|point| self.hit(point, now))
+            .filter(|p| tiles.get(p.track).is_some_and(|tile| !tile.heading))
+            .map(|p| p.slot);
+        self.hover.set(slot, now);
+    }
+
+    fn face_reveal(&self, placement: &Placement, now: Instant) -> f32 {
+        if self.focus.expanded().is_some_and(|(slot, _)| slot == placement.slot)
+            || self.focus.keyboard() == Some(placement.slot)
+            || self.linked == Some(placement.track)
+        {
+            1.0
+        } else {
+            self.hover.reveal(placement.slot, now)
+        }
+    }
+
     /// Pans so a tile showing `index` sits in the middle of the wall: the copy nearest the camera.
     pub fn center_on(&mut self, index: usize) {
         let found = match &self.layout {
@@ -428,14 +606,17 @@ impl Wall {
                     seats.into_iter().find(|place| place.track == index)
                 })
             }
-            &Layout::Blocks { count, offset, columns, rows } => {
+            Layout::Blocks { order, offset, columns, rows } => {
+                let Some(position) = order.iter().position(|&tile| tile == index) else { return };
+                let (count, offset, columns, rows) = (order.len(), *offset, *columns, *rows);
                 let (block_w, block_h) = (BLOCK_COLS as f32 * PITCH, BLOCK_ROWS as f32 * PITCH);
                 let (home_c, home_r) = ((self.pan.x / block_w).floor() as i32, (self.pan.y / block_h).floor() as i32);
                 let mut best: Option<(f32, Placement)> = None;
                 for row in home_r - rows..=home_r + rows {
                     for column in home_c - columns..=home_c + columns {
+                        let mask = reserved_mask(column, row, self.appearance.reserved());
                         for (slot, rect) in block_rects(column, row).into_iter().enumerate() {
-                            if wrap_item(column, row, slot, count, offset, columns, rows) != Some(index) {
+                            if wrap_item(column, row, slot, count, offset, (columns, rows), mask) != Some(position) {
                                 continue;
                             }
                             let distance = rect.center().distance(Point::new(self.pan.x, self.pan.y));
@@ -457,24 +638,54 @@ impl Wall {
 
     /// Lays out `tiles` around the wall's origin and fetches what lands on screen.
     pub fn relayout(&mut self, tiles: &[Tile], shape: Shape, omni: Option<&Omni>) -> Task<Message> {
+        self.layout_tiles(tiles, shape, omni, false)
+    }
+
+    pub(crate) fn layout_tiles(
+        &mut self,
+        tiles: &[Tile],
+        shape: Shape,
+        omni: Option<&Omni>,
+        keep_camera: bool,
+    ) -> Task<Message> {
         self.focus.reset();
+        self.hover = Default::default();
+        self.linked = None;
         self.layout = match shape {
             Shape::Blocks => {
                 let count = tiles.len();
-                let (columns, rows) = wrap_period(count);
-                // The start tile: the slot nearest the seam's far side shows item 0 (`getStartWrapOffset`).
-                let start = nearest_slot(0, 0, Point::new(GAP, 0.0));
+                let (columns, rows) = wrap_period(count, self.appearance.reserved());
+                // The start tile: the slot nearest the seam's far side shows the first ordered tile (`getStartWrapOffset`).
+                let mask = reserved_mask(0, 0, self.appearance.reserved());
+                let slot = nearest_slot(0, 0, Point::new(GAP, 0.0), mask);
+                let start = slot - (mask & ((1 << slot) - 1)).count_ones() as usize;
                 let offset = if count == 0 { 0 } else { (count - start % count) % count };
-                Layout::Blocks { count, offset, columns, rows }
+                Layout::Blocks { order: self.ordered_tiles(tiles), offset, columns, rows }
             }
-            Shape::Finite => Layout::Finite(place(tiles.len())),
-            Shape::Explore(sections) => Layout::Explore(lots::strip(&sections)),
+            Shape::Finite => {
+                let mut placements = place(tiles.len(), self.appearance.reserved());
+                for (placement, index) in placements.iter_mut().zip(self.ordered_tiles(tiles)) {
+                    placement.track = index;
+                }
+                Layout::Finite(placements)
+            }
+            Shape::Explore(mut sections) => {
+                if let Some(seed) = self.order_seed {
+                    for section in &mut sections {
+                        section.entries.sort_by_cached_key(|&(index, _)| order_rank(seed, tiles[index].id));
+                    }
+                }
+                Layout::Explore(lots::strip(&sections))
+            }
+            Shape::Radio => Layout::Finite(Vec::new()),
         };
-        self.pan = Vector::ZERO;
-        let (_, _, anchor) = self.grid();
-        self.anchor_x = anchor;
-        self.anchor_y = anchor;
-        self.planned = false;
+        if !keep_camera {
+            self.pan = Vector::ZERO;
+            let (_, _, anchor) = self.grid();
+            self.anchor_x = anchor;
+            self.anchor_y = anchor;
+            self.planned = false;
+        }
         self.inertia = None;
         self.glide = None;
         self.labels.clear();
@@ -523,7 +734,7 @@ impl Wall {
         let mut ghosts = std::mem::take(&mut self.ghosts);
         ghosts.clear();
         for placement in &self.shown {
-            let rect = self.screen(placement.rect);
+            let rect = self.drawn(placement, now);
             if !rect.intersects(&screen) || running.is_some_and(|shift| shift.arriving(rect, now).is_none()) {
                 continue;
             }
@@ -531,6 +742,8 @@ impl Wall {
             let loaded = self.cover_ref(tile.id);
             let layers = self.cover_layers_at(tile.id, now);
             ghosts.push(Ghost {
+                clear: self.appearance.look == folia_store::WallLook::Clear
+                    && self.focus.expanded().is_none_or(|(slot, _)| slot != placement.slot),
                 rect,
                 index: placement.track,
                 id: tile.id,
@@ -650,7 +863,7 @@ impl Wall {
                 (Task::none(), Some(hit))
             }
             Message::CoverLoaded { id, ticket, source, px, opaque, cover } => {
-                if self.cover_sources.get(&id) != Some(&source) {
+                if self.suspended || ticket <= self.closed_ticket || self.cover_sources.get(&id) != Some(&source) {
                     return (Task::none(), None);
                 }
                 let current = self.pending.get(&id).is_some_and(|request| request.ticket == ticket);
@@ -734,6 +947,11 @@ impl Wall {
         self.load_visible(tiles, omni)
     }
 
+    pub(crate) fn relabel(&mut self, tiles: &[Tile]) {
+        self.labels.clear();
+        self.fit_visible(tiles);
+    }
+
     /// Typesets the labels of tiles on screen that have none yet; measuring text is too slow to do every frame.
     fn fit_visible(&mut self, tiles: &[Tile]) {
         let Some(typeset) = self.typeset else { return };
@@ -776,6 +994,9 @@ impl Wall {
     /// Fetches covers for the tiles on screen that have none yet, nearest the middle of the window first.
     /// A cover is decoded square at a size step and cropped to each slot as it is drawn.
     fn load_visible(&mut self, tiles: &[Tile], omni: Option<&Omni>) -> Task<Message> {
+        if self.suspended {
+            return Task::none();
+        }
         let now = Instant::now();
         let scale = wall_scale(self.viewport.width);
         let middle = Point::new(self.viewport.width / 2.0, self.viewport.height / 2.0);
@@ -802,6 +1023,11 @@ impl Wall {
             let Some(tile) = tiles.get(placement.track) else { continue };
             self.covers.touch(&tile.id);
             self.thumbnails.touch(&tile.id);
+            if self.appearance.look == folia_store::WallLook::Clear
+                && self.focus.expanded().is_none_or(|(_, track)| track != placement.track)
+            {
+                continue;
+            }
             if tile.heading || self.covers.peek(&tile.id).is_some() || self.pending.contains_key(&tile.id) {
                 continue;
             }
@@ -885,6 +1111,7 @@ impl Wall {
     fn refresh(&mut self) {
         let mut shown = std::mem::take(&mut self.shown);
         shown.clear();
+        self.empty_slots.clear();
         self.culled_at = self.pan;
         if self.viewport.width >= 1.0 {
             let scale = wall_scale(self.viewport.width).max(0.01);
@@ -906,15 +1133,20 @@ impl Wall {
                         }
                     }
                 }
-                &Layout::Blocks { count, offset, columns, rows } => {
+                Layout::Blocks { order, offset, columns, rows } => {
+                    let (count, offset, columns, rows) = (order.len(), *offset, *columns, *rows);
                     let (block_w, block_h) = (BLOCK_COLS as f32 * PITCH, BLOCK_ROWS as f32 * PITCH);
                     for row in (low.y / block_h).floor() as i32..=(high.y / block_h).floor() as i32 {
                         for column in (low.x / block_w).floor() as i32..=(high.x / block_w).floor() as i32 {
+                            let mask = reserved_mask(column, row, self.appearance.reserved());
                             for (index, rect) in block_rects(column, row).into_iter().enumerate() {
-                                if let Some(track) = wrap_item(column, row, index, count, offset, columns, rows) {
+                                if let Some(track) = wrap_item(column, row, index, count, offset, (columns, rows), mask)
+                                {
                                     let slot =
                                         SlotId { column: i64::from(column), row: i64::from(row), index, lot: false };
-                                    shown.push(Placement { rect, track, slot });
+                                    shown.push(Placement { rect, track: order[track], slot });
+                                } else if self.appearance.look != folia_store::WallLook::Solid {
+                                    self.empty_slots.push((rect, mask & (1 << index) != 0));
                                 }
                             }
                         }
@@ -948,6 +1180,13 @@ impl Wall {
 
     pub fn viewport(&self) -> Size {
         self.viewport
+    }
+
+    pub(crate) fn home_camera(&mut self) {
+        let scale = wall_scale(self.viewport.width);
+        self.pan = Vector::new((self.viewport.width / 2.0 - 34.0) / scale, (self.viewport.height / 2.0 - 80.0) / scale);
+        self.focus.stop_camera();
+        self.refresh();
     }
 
     /// The seam on screen. A viewport that has not been measured yet reports a closed seam.
@@ -1008,7 +1247,13 @@ impl Wall {
 
     /// Whether the camera or the tiles move on their own: inertia, a wheel glide or a shift.
     pub fn coasting(&self) -> bool {
-        self.inertia.is_some()
+        if self.radio_departure.as_ref().is_some_and(|d| d.running(Instant::now())) {
+            return true;
+        }
+        self.hover.running(Instant::now())
+            || self.lights.running(Instant::now())
+            || self.tint.running(Instant::now())
+            || self.inertia.is_some()
             || self.glide.is_some()
             || self.shift.is_some()
             || self.cover_fades.values().any(|fade| cover_progress(fade.started, Instant::now()) < 1.0)
@@ -1016,6 +1261,9 @@ impl Wall {
 
     /// Steps the inertia, the wheel glide and the shift for this frame.
     pub fn tick_coast(&mut self, now: Instant, tiles: &[Tile], omni: Option<&Omni>) -> Task<Message> {
+        if self.radio_departure.as_ref().is_some_and(|d| !d.running(now)) {
+            self.radio_departure = None;
+        }
         self.cover_fades.retain(|_, fade| cover_progress(fade.started, now) < 1.0);
         if let Some(inertia) = self.inertia {
             let (pan, moving) = inertia.at(now);
@@ -1050,6 +1298,110 @@ impl Wall {
         self.show_visible(tiles, omni)
     }
 
+    pub(crate) fn surface<'a>(
+        &'a self,
+        tracks: &'a [Tile],
+        theme: &'a Theme,
+        daylight: bool,
+        playing: Option<i64>,
+        band: Option<crate::poster::Band<'a>>,
+    ) -> iced::Element<'a, Message> {
+        let canvas =
+            iced::Element::new(crate::wall_canvas::WallCanvas::new(self.view(tracks, theme, daylight, playing, band)));
+        folia_render::quality::poster_surface(canvas, move |regions, images| {
+            let now = Instant::now();
+            self.filter_regions(tracks, regions, now);
+            if !regions.is_empty() {
+                self.filter_images(tracks, playing, images, now);
+            }
+        })
+    }
+
+    pub(crate) fn filter_images(&self, tracks: &[Tile], playing: Option<i64>, images: &mut Vec<Handle>, now: Instant) {
+        let mut add = |image: &Handle| {
+            if matches!(image, Handle::Rgba { pixels, .. } if pixels.len() < 2 * 1024 * 1024) {
+                return;
+            }
+            if !images.iter().any(|added| added.id() == image.id()) {
+                images.push(image.clone());
+            }
+        };
+        for placement in &self.shown {
+            let Some(tile) = tracks.get(placement.track) else { continue };
+            let layers = self.cover_layers_at(tile.id, now);
+            for handle in [layers.image, layers.previous].into_iter().flatten() {
+                add(handle);
+            }
+            let restored = self.face_reveal(placement, now) > 0.5 || playing == Some(tile.id);
+            match self.art(placement, tile, self.drawn(placement, now), restored) {
+                Art::Mosaic { image, .. } => add(image),
+                Art::Shard { image, dots, .. } => {
+                    add(image);
+                    if let Some(dots) = dots {
+                        add(dots);
+                    }
+                }
+                Art::None => {}
+            }
+        }
+        for ghost in &self.ghosts {
+            for handle in [ghost.cover.as_ref(), ghost.previous_cover.as_ref()].into_iter().flatten() {
+                add(handle);
+            }
+        }
+    }
+
+    fn filter_regions(&self, tracks: &[Tile], regions: &mut Vec<folia_render::quality::PosterRegion>, now: Instant) {
+        if !self.hover.active() {
+            return;
+        }
+        let (w, h) = (self.viewport.width, self.viewport.height);
+        if w < 1.0 || h < 1.0 {
+            return;
+        }
+        let pivot = self.pivot();
+        let (sin, cos) = self.tilt.deg(now).to_radians().sin_cos();
+        let mut affected: Option<Rectangle> = None;
+        for place in (0..=3).flat_map(|depth| self.shown.iter().filter(move |p| self.depth(p.slot) == depth)) {
+            let Some(tile) = tracks.get(place.track) else { continue };
+            let amount =
+                if self.depth(place.slot) == 3 || tile.heading { 0.0 } else { self.hover.filter(place.slot, now) };
+            let rect = self.drawn(place, now);
+            let Some(pose) = self.arrival(rect, tile.id, now) else { continue };
+            let rect = Place { around: rect, pose }.rect(rect);
+            if rect.width < 0.001 || rect.height < 0.001 {
+                continue;
+            }
+            if amount > 0.0001 {
+                affected = Some(affected.map_or(rect, |prior| prior.union(&rect)));
+            } else if affected.is_none_or(|prior| !prior.intersects(&rect)) {
+                continue;
+            }
+            let d = rect.center() - pivot;
+            regions.push(folia_render::quality::PosterRegion {
+                center: [(pivot.x + cos * d.x - sin * d.y) / w, (pivot.y + sin * d.x + cos * d.y) / h],
+                x_axis: [2.0 * cos * w / rect.width, 2.0 * sin * h / rect.width],
+                y_axis: [-2.0 * sin * w / rect.height, 2.0 * cos * h / rect.height],
+                amount,
+                padding: 0.0,
+            });
+        }
+    }
+
+    fn arrival(&self, rect: Rectangle, id: i64, now: Instant) -> Option<Pose> {
+        if let Some(shift) = self.shift.filter(|shift| shift.running(now))
+            && !self.steady.iter().any(|&(steady, r)| steady == id && same_place(r, rect))
+        {
+            shift.arriving(rect, now)
+        } else {
+            Some(Pose::REST)
+        }
+    }
+
+    pub(crate) fn poster_ready(&self, rect: Rectangle, id: i64, now: Instant) -> bool {
+        self.arrival(rect, id, now).is_some_and(|pose| pose.alpha >= 0.99 && pose.squeeze >= 0.99)
+    }
+
     pub fn view<'a>(
         &'a self,
         tracks: &'a [Tile],
@@ -1060,6 +1412,12 @@ impl Wall {
     ) -> WallProgram<'a> {
         WallProgram { wall: self, tracks, theme, daylight, playing, band }
     }
+}
+
+fn order_rank(seed: u64, id: i64) -> u64 {
+    let mut hash = DefaultHasher::new();
+    (seed, id).hash(&mut hash);
+    hash.finish()
 }
 
 /// The placements of the lot the place `(column, row)` holds: its heading and its seats.
@@ -1087,8 +1445,8 @@ fn cover_step(px: f32) -> u32 {
 }
 
 /// `getWrapPeriod`: blocks per row and block rows of the repeat, from `getLatticeGeometry`.
-fn wrap_period(count: usize) -> (i32, i32) {
-    let blocks = count.max(1).div_ceil(SLOTS_PER_BLOCK) as f32;
+fn wrap_period(count: usize, reserved: u8) -> (i32, i32) {
+    let blocks = count.max(1).div_ceil(SLOTS_PER_BLOCK - usize::from(reserved)) as f32;
     let columns = if blocks <= 1.0 {
         1
     } else {
@@ -1104,14 +1462,36 @@ fn wrap_item(
     slot: usize,
     count: usize,
     offset: usize,
-    columns: i32,
-    rows: i32,
+    period: (i32, i32),
+    mask: u16,
 ) -> Option<usize> {
-    if count == 0 {
+    let (columns, rows) = period;
+    if count == 0 || mask & (1 << slot) != 0 {
         return None;
     }
     let block = (row.rem_euclid(rows) * columns + column.rem_euclid(columns)) as usize;
-    Some((block * SLOTS_PER_BLOCK + slot + offset) % count)
+    let rank = slot - (mask & ((1 << slot) - 1)).count_ones() as usize;
+    Some((block * (SLOTS_PER_BLOCK - mask.count_ones() as usize) + rank + offset) % count)
+}
+
+// The original blockReservedSlots hash and Mulberry32 shuffle keep windows stable as the count grows.
+fn reserved_mask(column: i32, row: i32, count: u8) -> u16 {
+    if count == 0 {
+        return 0;
+    }
+    let mut state = (column as u32).wrapping_mul(0x27d4eb2d) ^ (row as u32).wrapping_mul(0x165667b1) ^ 0x5bd1e995;
+    state = (state ^ (state >> 15)).wrapping_mul(0x85ebca6b);
+    state = (state ^ (state >> 13)).wrapping_mul(0xc2b2ae35);
+    state ^= state >> 16;
+    let mut order: [u8; SLOTS_PER_BLOCK] = std::array::from_fn(|index| index as u8);
+    for index in (1..SLOTS_PER_BLOCK).rev() {
+        state = state.wrapping_add(0x6d2b79f5);
+        let n = (state ^ (state >> 15)).wrapping_mul(1 | state);
+        let n = n.wrapping_add((n ^ (n >> 7)).wrapping_mul(61 | n)) ^ n;
+        let swap = (u64::from(n ^ (n >> 14)) * (index as u64 + 1)) >> 32;
+        order.swap(index, swap as usize);
+    }
+    order[..usize::from(count.min(6))].iter().fold(0, |bits, index| bits | (1 << index))
 }
 
 /// A block's slot rectangles in slot order, in unscaled wall pixels.
@@ -1125,14 +1505,16 @@ fn block_rects(column: i32, row: i32) -> [Rectangle; SLOTS_PER_BLOCK] {
 }
 
 /// `startKeyAt`: the slot of a block whose centre is nearest `point`.
-fn nearest_slot(column: i32, row: i32, point: Point) -> usize {
+fn nearest_slot(column: i32, row: i32, point: Point, mask: u16) -> usize {
     block_rects(column, row)
         .iter()
         .enumerate()
+        .filter(|(index, _)| mask & (1 << index) == 0)
         .min_by(|a, b| a.1.center().distance(point).total_cmp(&b.1.center().distance(point)))
         .map_or(0, |(slot, _)| slot)
 }
 
+#[derive(Clone, Copy)]
 pub struct WallProgram<'a> {
     wall: &'a Wall,
     tracks: &'a [Tile],
@@ -1141,6 +1523,14 @@ pub struct WallProgram<'a> {
     playing: Option<i64>,
     /// The poster's ground, drawn into the tilted seam with the walls while the layer turns.
     band: Option<crate::poster::Band<'a>>,
+}
+
+impl crate::wall_canvas::Layered<Message> for WallProgram<'_> {
+    fn draw_after(&self, renderer: &mut Renderer, now: Instant) {
+        if let Some(departure) = &self.wall.radio_departure {
+            departure.project(renderer, now);
+        }
+    }
 }
 
 impl canvas::Program<Message> for WallProgram<'_> {
@@ -1172,9 +1562,10 @@ impl canvas::Program<Message> for WallProgram<'_> {
                 let at = Point::new(position.x - bounds.x, position.y - bounds.y);
                 match state.moved(at, now) {
                     Gesture::Drag(moved) => Some(Action::publish(Message::Pan(moved * (-1.0 / scale))).and_capture()),
-                    _ => None,
+                    _ => Some(Action::request_redraw()),
                 }
             }
+            Event::Mouse(mouse::Event::CursorLeft) => Some(Action::request_redraw()),
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => match state.release(now) {
                 Gesture::Release(release) => Some(Action::publish(Message::Settled(release))),
                 Gesture::Click(from) => self.press(from, now),
@@ -1202,88 +1593,175 @@ impl canvas::Program<Message> for WallProgram<'_> {
         bounds: Rectangle,
         _cursor: mouse::Cursor,
     ) -> Vec<Geometry> {
-        let mut frame = Frame::new(renderer, bounds.size());
-        let Some(typeset) = self.wall.typeset else { return vec![frame.into_geometry()] };
+        let Some(typeset) = self.wall.typeset else { return Vec::new() };
         let palette = Palette::new(self.theme, self.daylight, &self.wall.shades);
         let now = Instant::now();
-        // `withTilt`: both halves and the seam turn about the poster's right edge at half the window's height.
         let deg = self.wall.tilt.deg(now);
         let tilted = deg.abs() > 0.001;
-        if tilted {
-            let pivot = self.wall.pivot();
-            frame.translate(Vector::new(pivot.x, pivot.y));
-            frame.rotate(deg.to_radians());
-            frame.translate(Vector::new(-pivot.x, -pivot.y));
-            if let Some(band) = self.band {
-                self.wall.draw_band(&mut frame, band);
+        let make_frame = || {
+            let mut frame = Frame::new(renderer, bounds.size());
+            if tilted {
+                let pivot = self.wall.pivot();
+                frame.translate(Vector::new(pivot.x, pivot.y));
+                frame.rotate(deg.to_radians());
+                frame.translate(Vector::new(-pivot.x, -pivot.y));
             }
-        }
-        let shift = self.wall.shift.filter(|shift| shift.running(now));
-        if let Some(shift) = shift {
-            self.draw_ghosts(&mut frame, shift, now, &typeset, &palette);
-        }
-        let screen = Rectangle::new(Point::ORIGIN, bounds.size());
+            frame
+        };
         let expanded = self.wall.focus.expanded().map(|(slot, _)| slot);
         let keyboard = self.wall.focus.keyboard();
-        let raised = |placement: &&Placement| Some(placement.slot) == expanded || Some(placement.slot) == keyboard;
-        // `z-index`: the rest, then the keyboard focus (4), then the grown card (20).
-        let order = self
-            .wall
-            .shown
-            .iter()
-            .filter(|placement| !raised(placement))
-            .chain(self.wall.shown.iter().filter(|p| Some(p.slot) == keyboard && Some(p.slot) != expanded))
-            .chain(self.wall.shown.iter().filter(|p| Some(p.slot) == expanded));
-        for placement in order {
-            let rect = self.wall.drawn(placement, now);
-            // The overscan is cut at the window, except on a turned layer whose corners swing into view.
-            let visible = tilted || rect.intersects(&screen);
-            let Some(item) = self.tracks.get(placement.track).filter(|_| visible) else { continue };
-            let steady = self.wall.steady.iter().any(|&(id, place)| id == item.id && same_place(place, rect));
-            let pose = match shift {
-                Some(shift) if !steady => shift.arriving(rect, now),
-                _ => Some(Pose::REST),
-            };
-            let Some(pose) = pose else { continue };
-            let world_width = self.wall.focus.rect(placement.slot, placement.rect, now).width;
-            let label = [
-                world_width,
-                self.wall.focus.target(placement.slot).map_or(placement.rect.width, |t| t.width),
-                placement.rect.width,
-            ]
-            .into_iter()
-            .find_map(|width| self.wall.labels.get(&(placement.track, width as u32)));
-            let grown = Some(placement.slot) == expanded;
-            let art = if grown || item.heading {
-                Art::None
-            } else {
-                self.wall.art(placement, item, rect, Some(placement.slot) == keyboard || self.playing == Some(item.id))
-            };
-            let loaded = self.wall.cover_ref(item.id);
-            let layers = self.wall.cover_layers_at(item.id, now);
-            let tile = Drawn {
-                rect,
-                index: placement.track,
-                cover: loaded.and_then(Option::as_ref),
-                previous_cover: layers.previous,
-                cover_opacity: layers.opacity,
-                fallback: shows_fallback(item, loaded),
-                art,
-                label: if grown { None } else { label },
-                current: self.playing == Some(item.id),
-                heading: item.heading,
-                hue: item.hue,
-                stack: item.stack,
-            };
-            draw_tile(&mut frame, &tile, pose, &typeset, &palette);
-            if grown {
-                draw_grown_shade(&mut frame, rect, &palette);
+        let screen = Rectangle::new(Point::ORIGIN, bounds.size());
+        let mut geometries = Vec::with_capacity(16);
+        // WallCanvas renders artwork, tint, text and lights in separate renderer layers at each depth.
+        for depth in 0..=3 {
+            if depth > 0 && !self.wall.shown.iter().any(|p| self.wall.depth(p.slot) == depth) {
+                continue;
             }
-            if Some(placement.slot) == keyboard {
-                draw_focus(&mut frame, rect, tile.current, self.daylight, &palette);
+            let (mut frame, mut tint, mut overlay, mut lights) =
+                (make_frame(), make_frame(), make_frame(), make_frame());
+            if depth == 0 {
+                if tilted && let Some(band) = self.band {
+                    self.wall.draw_band(&mut frame, band);
+                }
+                let gap = GAP * wall_scale(bounds.width);
+                for &(world, window) in &self.wall.empty_slots {
+                    let rect = self.wall.screen(world);
+                    if !window {
+                        frame.fill_rectangle(rect.position(), rect.size(), palette.poster);
+                    }
+                    frame.stroke(
+                        &Path::rectangle(rect.position(), rect.size()),
+                        Stroke::default().with_width(gap).with_color(rgb(self.theme.background, 1.0)),
+                    );
+                }
+                let shift = self.wall.shift.filter(|shift| shift.running(now));
+                if let Some(shift) = shift {
+                    self.draw_ghosts(&mut frame, shift, now, &typeset, &palette);
+                }
             }
+            let gap = GAP * wall_scale(bounds.width);
+            for placement in self.wall.shown.iter().filter(|p| self.wall.depth(p.slot) == depth) {
+                let rect = self.wall.drawn(placement, now);
+                // The overscan is cut at the window, except on a turned layer whose corners swing into view.
+                let visible = tilted || rect.intersects(&screen);
+                let Some(item) = self.tracks.get(placement.track).filter(|_| visible) else { continue };
+                let Some(mut pose) = self.wall.arrival(rect, item.id, now) else { continue };
+                let rest = self.wall.screen(self.wall.focus.rect(placement.slot, placement.rect, now));
+                if rest.width <= 0.0 || rest.height <= 0.0 {
+                    continue;
+                }
+                let scale_y = rect.height / rest.height;
+                pose.scale *= scale_y;
+                pose.squeeze *= rect.width / rest.width / scale_y;
+                let rect = rest;
+                let world_width = self.wall.focus.rect(placement.slot, placement.rect, now).width;
+                let label = [
+                    world_width,
+                    self.wall.focus.target(placement.slot).map_or(placement.rect.width, |t| t.width),
+                    placement.rect.width,
+                ]
+                .into_iter()
+                .find_map(|width| self.wall.labels.get(&(placement.track, width as u32)));
+                let grown = Some(placement.slot) == expanded;
+                let art = if grown || item.heading {
+                    Art::None
+                } else {
+                    self.wall.art(
+                        placement,
+                        item,
+                        rect,
+                        self.wall.face_reveal(placement, now) > 0.5 || self.playing == Some(item.id),
+                    )
+                };
+                let loaded = self.wall.cover_ref(item.id);
+                let layers = self.wall.cover_layers_at(item.id, now);
+                let reveal = self.wall.face_reveal(placement, now);
+                let clear = self.wall.appearance.look == folia_store::WallLook::Clear && !grown && !item.heading;
+                let (tint0, tint1, dim) = self.wall.overlays(
+                    self.theme,
+                    self.daylight,
+                    now,
+                    if self.playing == Some(item.id) { 1.0 } else { reveal },
+                );
+                let tile = Drawn {
+                    rect,
+                    index: placement.track,
+                    cover: loaded.and_then(Option::as_ref),
+                    previous_cover: layers.previous,
+                    cover_opacity: layers.opacity,
+                    fallback: shows_fallback(item, loaded),
+                    art,
+                    label,
+                    expanded: grown,
+                    badge: !self.wall.appearance.badge_current_only
+                        || item.badge.is_some()
+                        || self.playing == Some(item.id),
+                    current: self.playing == Some(item.id),
+                    heading: item.heading,
+                    hue: item.hue,
+                    stack: item.stack && !grown && self.wall.linked != Some(placement.track),
+                    page_extension: wall_scale(bounds.width)
+                        * (1.0
+                            - self
+                                .wall
+                                .focus
+                                .page_retraction(placement.slot, now)
+                                .max(self.wall.hover.pages(placement.slot, now))),
+                    page_wash: [tint1, dim],
+                };
+                let pose = if clear && !tile.current {
+                    Pose { alpha: pose.alpha * (1.0 - 0.72 * self.wall.lights.value(now) * (1.0 - reveal)), ..pose }
+                } else {
+                    pose
+                };
+                if self.wall.appearance.look != folia_store::WallLook::Solid {
+                    let outer = Rectangle {
+                        x: rect.x - gap / 2.0,
+                        y: rect.y - gap / 2.0,
+                        width: rect.width + gap,
+                        height: rect.height + gap,
+                    };
+                    frame.stroke(
+                        &Path::rectangle(outer.position(), outer.size()),
+                        Stroke::default().with_width(gap).with_color(rgb(self.theme.background, 1.0)),
+                    );
+                }
+                draw_tile(&mut frame, &tile, pose, &palette, clear);
+                if !tile.current && !tile.heading && !clear {
+                    let area = Place { around: rect, pose }.rect(rect);
+                    if tint0.a > 0.001 {
+                        let (start, end) = tint_axis(area);
+                        tint.fill_rectangle(
+                            area.position(),
+                            area.size(),
+                            gradient::Linear::new(start, end)
+                                .add_stop(0.0, faded(tint0, pose.alpha))
+                                .add_stop(1.0, faded(tint1, pose.alpha)),
+                        );
+                    }
+                    if dim.a > 0.001 {
+                        lights.fill_rectangle(area.position(), area.size(), faded(dim, pose.alpha));
+                    }
+                }
+                draw_copy_and_badge(&mut overlay, &tile, pose, &typeset, &palette);
+                if grown {
+                    draw_grown_shade(&mut tint, rect, &palette);
+                }
+                if Some(placement.slot) == keyboard {
+                    draw_focus(&mut overlay, rect, tile.current, self.daylight, &palette);
+                }
+            }
+            geometries.extend([
+                frame.into_geometry(),
+                tint.into_geometry(),
+                overlay.into_geometry(),
+                lights.into_geometry(),
+            ]);
         }
-        vec![frame.into_geometry()]
+        if let Some(departure) = &self.wall.radio_departure {
+            geometries.extend(departure.draw(renderer, self.theme, self.daylight, bounds.size(), now));
+        }
+        geometries
     }
 }
 
@@ -1291,17 +1769,7 @@ impl WallProgram<'_> {
     /// The tile under a click: the grown card on top, then the focused tile, then the rest in drawing order; a tilted
     /// layer is turned back first.
     fn press(&self, from: Point, now: Instant) -> Option<Action<Message>> {
-        let from = self.wall.untilt(from, now);
-        let expanded = self.wall.focus.expanded().map(|(slot, _)| slot);
-        let keyboard = self.wall.focus.keyboard();
-        let hit = self
-            .wall
-            .shown
-            .iter()
-            .filter(|p| Some(p.slot) == expanded)
-            .chain(self.wall.shown.iter().filter(|p| Some(p.slot) == keyboard && Some(p.slot) != expanded))
-            .chain(self.wall.shown.iter().rev())
-            .find(|p| self.wall.drawn(p, now).contains(from));
+        let hit = self.wall.hit(from, now);
         let Some(hit) = hit else { return Some(Action::publish(Message::Press(None, from))) };
         let tile = self.tracks.get(hit.track)?;
         (!tile.heading).then(|| Action::publish(Message::Press(Some((hit.track, hit.slot)), from)))
@@ -1320,12 +1788,17 @@ impl WallProgram<'_> {
                 fallback: ghost.fallback,
                 art: Art::None,
                 label: ghost.label.as_ref(),
+                expanded: false,
+                badge: !self.wall.appearance.badge_current_only || ghost.stack || self.playing == Some(ghost.id),
                 current: self.playing == Some(ghost.id),
                 heading: ghost.heading,
                 hue: ghost.hue,
                 stack: ghost.stack,
+                page_extension: wall_scale(self.wall.viewport.width),
+                page_wash: [Color::TRANSPARENT; 2],
             };
-            draw_tile(frame, &tile, pose, typeset, palette);
+            draw_tile(frame, &tile, pose, palette, ghost.clear);
+            draw_copy_and_badge(frame, &tile, pose, typeset, palette);
         }
     }
 }
@@ -1445,10 +1918,14 @@ struct Drawn<'a> {
     fallback: bool,
     art: Art<'a>,
     label: Option<&'a Label>,
+    expanded: bool,
+    badge: bool,
     current: bool,
     heading: bool,
     hue: f32,
     stack: bool,
+    page_extension: f32,
+    page_wash: [Color; 2],
 }
 
 /// The album wall's art in a tile's place: its share of the block's cover, or a zoomed duotone shard with dots.
@@ -1500,24 +1977,39 @@ fn faded(color: Color, alpha: f32) -> Color {
 }
 
 /// Draws a tile in a shift's pose; `Pose::REST` for a tile at rest.
-fn draw_tile(frame: &mut Frame, tile: &Drawn, pose: Pose, typeset: &Typeset, palette: &Palette) {
+fn draw_tile(frame: &mut Frame, tile: &Drawn, pose: Pose, palette: &Palette, clear: bool) {
     if pose.alpha <= 0.0 || pose.squeeze * pose.scale < 0.01 {
         return;
     }
     let place = Place { around: tile.rect, pose };
     let Rectangle { x, y, width, height } = tile.rect;
     let alpha = pose.alpha;
-    if tile.stack {
+    if tile.stack && !clear && tile.page_extension > 0.001 {
+        let paper = |base: Color| {
+            tile.page_wash.iter().fold(base, |c, ink| {
+                Color::from_rgb(c.r + (ink.r - c.r) * ink.a, c.g + (ink.g - c.g) * ink.a, c.b + (ink.b - c.b) * ink.a)
+            })
+        };
         // `has-stack-edges`: pages 6px and 3px down-right, each with a 1px line round it, under the poster.
         for (offset, page) in [(6.0, palette.page_far), (3.0, palette.page_near)] {
-            let line =
-                Rectangle::new(Point::new(x + offset - 1.0, y + offset - 1.0), Size::new(width + 2.0, height + 2.0));
-            place.fill(frame, line, faded(palette.page_line, alpha));
-            place.fill(frame, Rectangle::new(Point::new(x + offset, y + offset), tile.rect.size()), faded(page, alpha));
+            let offset = offset * tile.page_extension;
+            let spread = tile.page_extension;
+            let line = Rectangle::new(
+                Point::new(x + offset - spread, y + offset - spread),
+                Size::new(width + 2.0 * spread, height + 2.0 * spread),
+            );
+            place.fill(frame, line, faded(paper(palette.page_line), alpha));
+            place.fill(
+                frame,
+                Rectangle::new(Point::new(x + offset, y + offset), tile.rect.size()),
+                faded(paper(page), alpha),
+            );
         }
     }
-    place.fill(frame, tile.rect, faded(palette.poster, alpha));
-    if !tile.heading {
+    if !clear {
+        place.fill(frame, tile.rect, faded(palette.poster, alpha));
+    }
+    if !tile.heading && !clear {
         if tile.fallback {
             let fallback =
                 gradient::Linear::new(place.point(Point::new(x, y)), place.point(Point::new(x + width, y + height)))
@@ -1530,6 +2022,12 @@ fn draw_tile(frame: &mut Frame, tile: &Drawn, pose: Pose, typeset: &Typeset, pal
         let shade = if matches!(tile.art, Art::Mosaic { .. }) { palette.mosaic(alpha) } else { palette.shade(alpha) };
         frame.draw_image(place.rect(tile.rect), shade);
     }
+}
+
+fn draw_copy_and_badge(frame: &mut Frame, tile: &Drawn, pose: Pose, typeset: &Typeset, palette: &Palette) {
+    let place = Place { around: tile.rect, pose };
+    let Rectangle { x, y, width, height } = tile.rect;
+    let alpha = pose.alpha;
     if pose.squeeze < 1.0 {
         frame.with_clip(place.rect(tile.rect), |clipped| draw_marks(clipped, tile, place, typeset, palette));
     } else {
@@ -1542,6 +2040,13 @@ fn draw_tile(frame: &mut Frame, tile: &Drawn, pose: Pose, typeset: &Typeset, pal
             Stroke::default().with_width(2.0).with_color(faded(palette.accent, alpha)),
         );
     }
+}
+
+// CSS gradient angles start at the top of the tile and rotate clockwise.
+fn tint_axis(rect: Rectangle) -> (Point, Point) {
+    let (sin, cos) = 145.0_f32.to_radians().sin_cos();
+    let delta = Vector::new(sin, -cos) * (0.5 * (rect.width * sin.abs() + rect.height * cos.abs()));
+    (rect.center() - delta, rect.center() + delta)
 }
 
 /// The cover, or the album wall's piece of it, clipped to the tile.
@@ -1595,7 +2100,12 @@ fn draw_dots(frame: &mut Frame, rect: Rectangle, place: Place, dots: canvas::Ima
 
 /// The corner tag and the copy; a mosaic's copy stands on a shadow 1px below.
 fn draw_marks(frame: &mut Frame, tile: &Drawn, place: Place, typeset: &Typeset, palette: &Palette) {
-    draw_badge(frame, tile, place, typeset, palette);
+    if tile.badge {
+        draw_badge(frame, tile, place, typeset, palette);
+    }
+    if tile.expanded {
+        return;
+    }
     let Some(label) = tile.label else { return };
     let alpha = place.pose.alpha;
     if matches!(tile.art, Art::Mosaic { .. }) {
@@ -1700,18 +2210,22 @@ fn hsl(hue: f32, saturation: f32, lightness: f32) -> Color {
 }
 
 /// Every slot of the blocks around the origin, ranked like the original `rankSlots` and filled in order.
-fn place(count: usize) -> Vec<Placement> {
+fn place(count: usize, reserved: u8) -> Vec<Placement> {
     if count == 0 {
         return Vec::new();
     }
     let mut radius = 0;
-    while ((radius * 2 + 1) * (radius * 2 + 1)) as usize * SLOTS_PER_BLOCK < count * 2 {
+    while ((radius * 2 + 1) * (radius * 2 + 1)) as usize * (SLOTS_PER_BLOCK - usize::from(reserved)) < count * 2 {
         radius += 1;
     }
     let mut slots: Vec<(f32, Rectangle, SlotId)> = Vec::new();
     for row in -radius..=radius {
         for column in -radius..=radius {
+            let mask = reserved_mask(column, row, reserved);
             for (index, (x, y, cols, rows)) in block(column, row).into_iter().enumerate() {
+                if mask & (1 << index) != 0 {
+                    continue;
+                }
                 let rect = Rectangle {
                     x: (column * BLOCK_COLS + x) as f32 * PITCH,
                     y: (row * BLOCK_ROWS + y) as f32 * PITCH,
@@ -1906,6 +2420,34 @@ impl Wall {
         self.refresh();
     }
 
+    /// Lattice centres its expanded poster; the library keeps its own minimal reveal rule.
+    pub(crate) fn expand_centered(&mut self, slot: SlotId, tile: usize, instant: bool) {
+        self.expand(slot, tile, 0.0);
+        if let Some(rect) = self.focus.target(slot) {
+            let target = Vector::new(rect.center_x(), rect.center_y());
+            if instant {
+                self.pan = target;
+                self.focus.finish();
+            } else {
+                self.focus.tween_to(self.pan, target, Instant::now());
+            }
+            self.refresh();
+        }
+    }
+
+    pub(crate) fn restore_poster(&mut self, slot: SlotId, tile: usize, screen: Rectangle) {
+        self.expand(slot, tile, 0.0);
+        if let Some(rect) = self.focus.target(slot) {
+            let scale = wall_scale(self.viewport.width);
+            let offset = screen.center() - Point::new(self.viewport.width / 2.0, self.viewport.height / 2.0);
+            if screen.intersects(&Rectangle::with_size(self.viewport)) {
+                self.pan = Vector::new(rect.center_x(), rect.center_y()) - offset * (1.0 / scale);
+            }
+            self.focus.finish();
+            self.refresh();
+        }
+    }
+
     /// `collapse`.
     pub fn collapse(&mut self) {
         let Some((slot, _)) = self.focus.expanded() else { return };
@@ -1963,6 +2505,9 @@ impl Wall {
 
     /// One frame of the focus card: the camera tween moves the wall; finished folds are dropped.
     pub fn tick_focus(&mut self, now: Instant) -> bool {
+        if self.radio_departure.as_ref().is_some_and(|d| !d.running(now)) {
+            self.radio_departure = None;
+        }
         let moved = self.focus.camera(now);
         if let Some(pan) = moved {
             self.pan = pan;
@@ -2078,6 +2623,22 @@ impl Wall {
         self.focus.tween_to(self.pan, target, Instant::now());
     }
 
+    fn overlays(&self, theme: &Theme, daylight: bool, now: Instant, reveal: f32) -> (Color, Color, Color) {
+        let cover = 1.0 - reveal;
+        let dim =
+            Color { a: self.lights.value(now) * 0.82 * cover, ..if daylight { Color::WHITE } else { Color::BLACK } };
+        let alpha = self.tint.value(now)
+            * self.appearance.intensity.clamp(0.0, 1.0)
+            * if daylight { 0.72 } else { 1.0 }
+            * cover;
+        let (a, b) = if self.appearance.custom_tint {
+            (self.appearance.tint_color, self.appearance.tint_color)
+        } else {
+            (theme.background.mix(theme.accent, 0.22), theme.background.mix(theme.secondary, 0.16))
+        };
+        (rgb(a, alpha), rgb(b, alpha), dim)
+    }
+
     /// Cover quads for the glass blur. Layout and hit testing stay on the canvas; this is only the picture
     /// under the panels. Text and badges stay out of it.
     pub(crate) fn glass_scene(
@@ -2085,6 +2646,7 @@ impl Wall {
         tracks: &[Tile],
         theme: &Theme,
         daylight: bool,
+        playing: Option<i64>,
         now: Instant,
     ) -> folia_render::BackdropScene {
         let poster_rgb = theme.background.mix(theme.primary, if daylight { 0.06 } else { 0.12 });
@@ -2102,17 +2664,21 @@ impl Wall {
         let mut stamp = 0x8422_23f5u64;
         let screen = Rectangle::new(Point::ORIGIN, self.viewport);
         let expanded = self.focus.expanded().map(|(slot, _)| slot);
-        for placement in &self.shown {
+        for placement in (0..=3).flat_map(|depth| self.shown.iter().filter(move |p| self.depth(p.slot) == depth)) {
             let rect = self.drawn(placement, now);
             if !rect.intersects(&screen) {
                 continue;
             }
             let Some(item) = tracks.get(placement.track) else { continue };
             let grown = Some(placement.slot) == expanded;
+            let hover_filter = if grown || item.heading { 0.0 } else { self.hover.filter(placement.slot, now) };
+            if !grown && !item.heading && self.appearance.look == folia_store::WallLook::Clear {
+                continue;
+            }
             let art = if grown || item.heading {
                 Art::None
             } else {
-                self.art(placement, item, rect, Some(placement.slot) == self.focus.keyboard())
+                self.art(placement, item, rect, self.face_reveal(placement, now) > 0.5 || playing == Some(item.id))
             };
             let loaded = self.cover_ref(item.id);
             let (image, uv, shade_kind) = glass_art(&art, loaded.and_then(Option::as_ref), rect, item.heading);
@@ -2122,6 +2688,7 @@ impl Wall {
                 if let Some(previous) = layers.previous {
                     let preview = push_cover(&mut images, previous);
                     quads.push(folia_render::CoverQuad {
+                        hover_filter,
                         rect: [rect.x, rect.y, rect.width, rect.height],
                         uv,
                         image: preview,
@@ -2142,6 +2709,7 @@ impl Wall {
                 (poster, poster)
             };
             quads.push(folia_render::CoverQuad {
+                hover_filter,
                 rect: [rect.x, rect.y, rect.width, rect.height],
                 uv,
                 image: index,
@@ -2150,6 +2718,28 @@ impl Wall {
                 shade: shade_kind,
                 alpha: opacity,
             });
+            if !item.heading && Some(item.id) != playing {
+                let (first, last, dim) = self.overlays(theme, daylight, now, self.face_reveal(placement, now));
+                for (from, to) in [(first, last), (dim, dim)] {
+                    if from.a <= 0.001 {
+                        continue;
+                    }
+                    quads.push(folia_render::CoverQuad {
+                        hover_filter,
+                        rect: [rect.x, rect.y, rect.width, rect.height],
+                        uv,
+                        image: u32::MAX,
+                        color0: color_of(from),
+                        color1: color_of(to),
+                        shade: 2.0,
+                        alpha: from.a,
+                    });
+                    for channel in [from.r, from.g, from.b, from.a, to.r, to.g, to.b] {
+                        stamp = stamp.wrapping_mul(0x0000_0100_0000_01b3).wrapping_add(u64::from(channel.to_bits()));
+                    }
+                }
+            }
+            stamp = stamp.wrapping_mul(0x0000_0100_0000_01b3).wrapping_add(u64::from(hover_filter.to_bits()));
             stamp = stamp.wrapping_mul(0x0000_0100_0000_01b3).wrapping_add(u64::from(opacity.to_bits()));
             stamp = stamp.wrapping_mul(0x0000_0100_0000_01b3).wrapping_add((rect.x * 2.0).round() as i32 as u64);
             stamp = stamp.wrapping_add((rect.y * 2.0).round() as i32 as u64);
@@ -2168,10 +2758,14 @@ impl Wall {
         }
     }
 
+    fn hover_pop(&self, slot: SlotId, now: Instant) -> f32 {
+        self.focus.pop(slot, now).max(self.hover.pop(slot, now))
+    }
+
     /// A drawn tile's rect on screen: moved with its block, popped by keyboard focus.
     fn drawn(&self, placement: &Placement, now: Instant) -> Rectangle {
         let rect = self.screen(self.focus.rect(placement.slot, placement.rect, now));
-        let pop = self.focus.pop(placement.slot, now);
+        let pop = self.hover_pop(placement.slot, now);
         if pop > 0.0 && self.focus.expanded().is_none_or(|(slot, _)| slot != placement.slot) {
             focus_card::popped(rect, GAP * wall_scale(self.viewport.width), pop)
         } else {
@@ -2182,27 +2776,17 @@ impl Wall {
 
 /// `.is-expanded .lattice-poster-shade`: a band up from the bottom and one in from the left, over the card's own shade.
 fn draw_grown_shade(frame: &mut Frame, rect: Rectangle, palette: &Palette) {
-    let Rectangle { x, y, width, height } = rect;
-    let mut up = gradient::Linear::new(Point::new(x, y + height), Point::new(x, y));
-    for (at, alpha) in focus_card::EXPANDED_SHADE {
-        up = up.add_stop(at, palette.tint(alpha));
-    }
-    frame.fill(&Path::rectangle(rect.position(), rect.size()), up);
-    let mut across = gradient::Linear::new(Point::new(x, y), Point::new(x + width, y));
-    for (at, alpha) in focus_card::EXPANDED_SIDE {
-        across = across.add_stop(at, palette.tint(alpha));
-    }
-    frame.fill(&Path::rectangle(rect.position(), rect.size()), across);
+    // Sample the masks once, then scale them with the cover instead of rebuilding gradient
+    // meshes throughout reflow. These tiny strips are shared by all wall tiles.
+    frame.draw_image(rect, canvas::Image::new(palette.shade.expanded_up.clone()));
+    frame.draw_image(rect, canvas::Image::new(palette.shade.expanded_side.clone()));
 }
 
 /// Keyboard focus: the top highlight (`::after`, white 10% to nothing at 60%) and, on a tile without the playing
 /// stroke, the ring of hairline, ink and hairline outside it.
 fn draw_focus(frame: &mut Frame, rect: Rectangle, current: bool, daylight: bool, palette: &Palette) {
-    let Rectangle { x, y, height, .. } = rect;
-    let glow = gradient::Linear::new(Point::new(x, y), Point::new(x, y + height))
-        .add_stop(0.0, Color::from_rgba(1.0, 1.0, 1.0, 0.1))
-        .add_stop(0.6, Color::TRANSPARENT);
-    frame.fill(&Path::rectangle(rect.position(), rect.size()), glow);
+    let Rectangle { x, y, .. } = rect;
+    frame.draw_image(rect, canvas::Image::new(palette.shade.focus_glow.clone()));
     if current {
         return;
     }
@@ -2229,6 +2813,20 @@ impl Wall {
         match &self.layout {
             Layout::Finite(placements) => Some(placements.len()),
             _ => None,
+        }
+    }
+
+    /// Home and End follow the displayed ordering; endless walls have no last tile.
+    pub fn boundary_slot(&self, last: bool) -> Option<SlotId> {
+        match &self.layout {
+            Layout::Finite(placements) => {
+                let placement = if last { placements.last() } else { placements.first() };
+                placement.map(|placement| placement.slot)
+            }
+            Layout::Blocks { order, .. } => {
+                (!last).then(|| order.first()).flatten().and_then(|&index| self.slot_of(index))
+            }
+            Layout::Explore(_) => (!last).then(|| self.slot_of(0)).flatten(),
         }
     }
 

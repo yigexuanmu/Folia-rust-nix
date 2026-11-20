@@ -131,6 +131,54 @@ fn defaults_match_the_original_panel() {
     assert_eq!(Style::Lumiere.label_key(), "ui.visualizerLumiere");
 }
 
+#[test]
+#[cfg_attr(feature = "ci", ignore = "needs a hardware GPU")]
+fn bloom_filters_share_only_immutable_resources() {
+    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).unwrap();
+    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).unwrap();
+    let mut first = lumiere::bloom::Filter::new(&device, wgpu::TextureFormat::Rgba8Unorm, wgpu::BlendState::REPLACE);
+    let before = instance.generate_report().unwrap().hub;
+    let mut second = first.with_shared_pipelines(&device);
+    let shared = instance.generate_report().unwrap().hub;
+    assert_eq!(shared.render_pipelines.num_allocated, before.render_pipelines.num_allocated);
+    assert_eq!(shared.samplers.num_allocated, before.samplers.num_allocated);
+    assert_eq!(shared.bind_group_layouts.num_allocated, before.bind_group_layouts.num_allocated);
+    assert_eq!(shared.buffers.num_allocated, before.buffers.num_allocated + 2);
+    first.sync(&device, &queue, 128, 64, &lumiere::bloom::GRAPHICS);
+    second.sync(&device, &queue, 64, 32, &lumiere::bloom::TEXT);
+    assert!(first.scene().is_some() && second.scene().is_some());
+    first.release();
+    assert!(first.scene().is_none() && second.scene().is_some());
+    first.sync(&device, &queue, 64, 32, &lumiere::bloom::TEXT);
+    second.release();
+    assert!(first.scene().is_some() && second.scene().is_none());
+}
+
+#[test]
+#[cfg(all(feature = "stress", not(feature = "ci")))]
+#[ignore = "explicit release GPU stress check"]
+fn bloom_uniform_upload_cost() {
+    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).unwrap();
+    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).unwrap();
+    let mut graphics = lumiere::bloom::Filter::new(&device, wgpu::TextureFormat::Rgba8Unorm, wgpu::BlendState::REPLACE);
+    let mut text = lumiere::bloom::Filter::new(&device, wgpu::TextureFormat::Rgba8Unorm, wgpu::BlendState::REPLACE);
+    let mut times = Vec::new();
+    for frame in 0..612 {
+        let start = std::time::Instant::now();
+        graphics.sync(&device, &queue, WIDTH, HEIGHT, &lumiere::bloom::GRAPHICS);
+        text.sync(&device, &queue, WIDTH, HEIGHT, &lumiere::bloom::TEXT);
+        if frame >= 12 {
+            times.push(start.elapsed().as_secs_f64() * 1000.0);
+        }
+        queue.submit([]);
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+    }
+    times.sort_by(f64::total_cmp);
+    println!("BLOOM_SYNC frames=600 cpu_median_ms={:.6} cpu_p95_ms={:.6}", (times[299] + times[300]) * 0.5, times[569]);
+}
+
 /// The stage pass of one frame, drawn the way the app's shader widget draws it.
 #[cfg(all(feature = "stress", not(feature = "ci")))]
 fn stage<'a>(
@@ -141,6 +189,9 @@ fn stage<'a>(
 ) -> <lumiere::Field<'a, ()> as Program<()>>::Primitive {
     let theme = Theme::MIDNIGHT;
     let scene = folia_visualizer::Scene {
+        smart_beat: Default::default(),
+        paused: false,
+        daylight: false,
         style: Style::Lumiere,
         lyrics,
         time,
@@ -154,6 +205,8 @@ fn stage<'a>(
         artist: String::new(),
         album: String::new(),
         portrait: None,
+        render_quality: folia_core::LyricRenderQuality::default(),
+        static_mode: false,
         typography: folia_visualizer::Typography::default(),
         preview: false,
         audio: &folia_core::AudioFrame::SILENT,
@@ -180,7 +233,8 @@ fn atlas_over_a_whole_song() {
     let mut side_at = Vec::new();
     let mut time = 0.0;
     while time < end {
-        let pass = stage(&lyrics, time, "lumiere", &state);
+        let scene_pass = stage(&lyrics, time, "lumiere", &state);
+        let pass = scene_pass.current_pass().unwrap();
         let sprites = pass.glyphs.lock();
         most_sprites = most_sprites.max(sprites.len());
         most_echo = most_echo.max(pass.echo);
@@ -277,7 +331,7 @@ impl Picture {
         }
     }
 
-    /// The stack `lyric_view` builds: stage pass, front bokeh, then the clear canvas with the frame.
+    /// The stack `lyric_view` builds: complete scene pass, then the clear canvas with the frame.
     fn render(
         &mut self,
         lyrics: &Lyrics,
@@ -288,6 +342,9 @@ impl Picture {
     ) -> (Vec<u8>, &'static str, usize, (u32, usize)) {
         let bounds = Rectangle { x: 0.0, y: 0.0, width: WIDTH as f32, height: HEIGHT as f32 };
         let scene = || folia_visualizer::Scene {
+            smart_beat: Default::default(),
+            paused: false,
+            daylight: false,
             style: Style::Lumiere,
             lyrics,
             time,
@@ -301,6 +358,8 @@ impl Picture {
             artist: String::new(),
             album: String::new(),
             portrait: None,
+            render_quality: folia_core::LyricRenderQuality::default(),
+            static_mode: false,
             typography: folia_visualizer::Typography::default(),
             preview: false,
             audio: &folia_core::AudioFrame::SILENT,
@@ -308,21 +367,15 @@ impl Picture {
         let state = lumiere::LiveState::default();
         let field = lumiere::field_view::<()>(scene());
         let pass = Program::draw(&field, &state, mouse::Cursor::Unavailable, bounds);
-        let scale = f32::from_le_bytes(pass.bytes[824..828].try_into().unwrap());
+        let current = pass.current_pass().unwrap();
+        let scale = f32::from_le_bytes(current.bytes[824..828].try_into().unwrap());
         assert!(scale > 0.5, "camera scale {scale}");
-        let line_bytes = pass.lines.as_ref().map(|bytes| bytes.len()).unwrap_or(0);
-        let sprites = (pass.echo, pass.glyphs.lock().len());
-        let kind = pass.kind;
+        let line_bytes = current.lines.as_ref().map(|bytes| bytes.len()).unwrap_or(0);
+        let sprites = (current.echo, current.glyphs.lock().len());
+        let kind = current.kind;
         self.reset();
         ShaderDraw::draw_primitive(&mut self.renderer, bounds, pass);
         present(&mut self.renderer, self.format, Some(iced::Color::BLACK), &self.frame_view, &self.viewport);
-
-        self.reset();
-        let front_state = lumiere::LiveState::default();
-        let front = lumiere::front_view::<()>(scene());
-        let over = Program::draw(&front, &front_state, mouse::Cursor::Unavailable, bounds);
-        ShaderDraw::draw_primitive(&mut self.renderer, bounds, over);
-        present(&mut self.renderer, self.format, None, &self.frame_view, &self.viewport);
 
         self.reset();
         let canvas_state = folia_visualizer::SceneState::default();

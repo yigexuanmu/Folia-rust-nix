@@ -245,7 +245,16 @@ impl Focus {
 
     /// The keyboard focus pop (each side out by a gap) of a slot: 1 for the focused one once it has popped.
     pub fn pop(&self, slot: SlotId, now: Instant) -> f32 {
-        let t = self.pop_at.map_or(1.0, |at| ease_at(at, now, POP_MS, EASE_OUT));
+        self.focus_progress(slot, now, EASE_OUT)
+    }
+
+    /// Collection shadows retract with the original 300ms CSS ease, independently of the card transform.
+    pub fn page_retraction(&self, slot: SlotId, now: Instant) -> f32 {
+        self.focus_progress(slot, now, Ease::new(0.25, 0.1, 0.25, 1.0))
+    }
+
+    fn focus_progress(&self, slot: SlotId, now: Instant, ease: Ease) -> f32 {
+        let t = self.pop_at.map_or(1.0, |at| ease_at(at, now, POP_MS, ease));
         if self.keyboard == Some(slot) {
             t
         } else if self.left == Some(slot) {
@@ -287,11 +296,29 @@ impl Focus {
         self.camera = None;
     }
 
+    /// Opens a wall already settled on its initial poster, without replaying the expansion.
+    pub fn finish(&mut self) {
+        let now = Instant::now();
+        for motion in &mut self.motions {
+            motion.at = now.checked_sub(std::time::Duration::from_secs(10)).unwrap_or(now);
+        }
+        self.camera = None;
+        self.pop_at = None;
+        self.expanded_at = None;
+        self.settle(now);
+    }
+
     pub fn animating(&self, now: Instant) -> bool {
         self.camera.is_some()
             || self.motions.iter().any(|motion| motion.running(now))
             || self.pop_at.is_some_and(|at| ease_at(at, now, POP_MS, EASE_OUT) < 1.0)
             || self.expanded_at.is_some_and(|at| self.actions_reveal(now).0 < 1.0 && now >= at)
+    }
+
+    pub fn expansion_settled(&self, now: Instant) -> bool {
+        self.expanded.is_some_and(|(slot, _)| {
+            self.motions.iter().filter(|motion| motion.block == slot.block()).all(|motion| !motion.running(now))
+        })
     }
 
     /// Drops the finished folds back to rest so a block at rest has no motion left.
@@ -435,6 +462,7 @@ pub fn adjacent(
 /// What the card's buttons do.
 #[derive(Debug, Clone)]
 pub enum Action {
+    Catalog(crate::catalog::Message),
     /// The original's "Play now", or pause / resume on the playing song.
     Play,
     /// The original's "Enter": the playing page.
@@ -446,6 +474,7 @@ pub enum Action {
 /// What the card shows of its song and the player.
 pub struct Card<'a> {
     pub track: &'a Track,
+    pub catalog: folia_omni::Capabilities,
     pub queued: bool,
     pub current: bool,
     pub playing: bool,
@@ -480,19 +509,24 @@ pub fn body<'a>(i18n: &'a I18n, card: Card<'a>, reveal: (f32, f32)) -> Element<'
     };
     let mark = |value: &'static str| text(value).size(17.0 * s).color(fade(0.85 * 0.5));
     let mut links: Vec<Element<'a, Action>> = Vec::new();
-    if let Some(artist) = card.track.artist.as_ref().filter(|artist| !artist.is_empty()) {
-        for (index, name) in artist.split(" / ").enumerate() {
-            if index > 0 {
-                links.push(mark(",").into());
-            }
-            links.push(link(name.to_owned()).into());
+    for (index, (name, action)) in crate::credits::artists(card.track, card.catalog.artists).into_iter().enumerate() {
+        if index > 0 {
+            links.push(mark(",").into());
         }
+        links
+            .push(button(link(name)).padding(0).on_press_maybe(action.map(Action::Catalog)).style(button::text).into());
     }
     if let Some(album) = card.track.album.as_ref().filter(|album| !album.is_empty()) {
         if !links.is_empty() {
             links.push(mark("·").into());
         }
-        links.push(link(album.clone()).into());
+        links.push(
+            button(link(album.clone()))
+                .padding(0)
+                .on_press_maybe(crate::credits::album(card.track, card.catalog.albums).map(Action::Catalog))
+                .style(button::text)
+                .into(),
+        );
     }
     if card.track.duration > 0.0 {
         links.push(mark("·").into());

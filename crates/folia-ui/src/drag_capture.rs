@@ -9,8 +9,10 @@ use iced::{Element, Event, Length, Point, Rectangle, Size, Theme, Vector, keyboa
 /// (`setPointerCapture`), and Escape; otherwise a left press on the handle strip is reported.
 pub struct Capture<'a, Message> {
     content: Element<'a, Message>,
+    take_press: bool,
     held: bool,
     grabbing: bool,
+    cursor: Option<mouse::Interaction>,
     /// The strip at the left whose presses start a drag, and how far down rows reach, in the list's coordinates.
     handle: Rectangle,
     on_press: Box<dyn Fn(Point) -> Message + 'a>,
@@ -30,8 +32,10 @@ impl<'a, Message> Capture<'a, Message> {
     ) -> Self {
         Self {
             content: content.into(),
+            take_press: false,
             held: false,
             grabbing: false,
+            cursor: None,
             handle,
             on_press: Box::new(on_press),
             on_move: Box::new(on_move),
@@ -46,9 +50,30 @@ impl<'a, Message> Capture<'a, Message> {
         self.grabbing = grabbing;
         self
     }
+
+    pub fn before_child(mut self) -> Self {
+        self.take_press = true;
+        self
+    }
+
+    /// Chooses the cursor over the drag surface and during capture.
+    pub fn cursor(mut self, cursor: mouse::Interaction) -> Self {
+        self.cursor = Some(cursor);
+        self
+    }
 }
 
+#[derive(Default)]
+struct Captured(bool);
+
 impl<Message: Clone> Widget<Message, Theme, iced::Renderer> for Capture<'_, Message> {
+    fn tag(&self) -> iced::advanced::widget::tree::Tag {
+        iced::advanced::widget::tree::Tag::of::<Captured>()
+    }
+    fn state(&self) -> iced::advanced::widget::tree::State {
+        iced::advanced::widget::tree::State::new(Captured::default())
+    }
+
     fn children(&self) -> Vec<Tree> {
         vec![Tree::new(&self.content)]
     }
@@ -87,7 +112,19 @@ impl<Message: Clone> Widget<Message, Theme, iced::Renderer> for Capture<'_, Mess
         viewport: &Rectangle,
     ) {
         let bounds = layout.bounds();
-        if self.held {
+        let captured = tree.state.downcast_mut::<Captured>();
+        if self.take_press
+            && !self.held
+            && !captured.0
+            && matches!(event, Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)))
+            && let Some(at) = cursor.position_in(bounds).filter(|at| self.handle.contains(*at))
+        {
+            captured.0 = true;
+            shell.publish((self.on_press)(at));
+            shell.capture_event();
+            return;
+        }
+        if self.held || captured.0 {
             match event {
                 Event::Mouse(mouse::Event::CursorMoved { position }) => {
                     shell.publish((self.on_move)(Point::new(position.x - bounds.x, position.y - bounds.y)));
@@ -95,6 +132,7 @@ impl<Message: Clone> Widget<Message, Theme, iced::Renderer> for Capture<'_, Mess
                     return;
                 }
                 Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
+                    captured.0 = false;
                     shell.publish(self.on_release.clone());
                     shell.capture_event();
                     return;
@@ -103,6 +141,7 @@ impl<Message: Clone> Widget<Message, Theme, iced::Renderer> for Capture<'_, Mess
                     key: keyboard::Key::Named(keyboard::key::Named::Escape),
                     ..
                 }) => {
+                    captured.0 = false;
                     shell.publish(self.on_cancel.clone());
                     shell.capture_event();
                     return;
@@ -145,10 +184,10 @@ impl<Message: Clone> Widget<Message, Theme, iced::Renderer> for Capture<'_, Mess
         renderer: &iced::Renderer,
     ) -> mouse::Interaction {
         if self.grabbing {
-            return mouse::Interaction::Grabbing;
+            return self.cursor.unwrap_or(mouse::Interaction::Grabbing);
         }
         if cursor.position_in(layout.bounds()).is_some_and(|at| self.handle.contains(at)) {
-            return mouse::Interaction::Grab;
+            return self.cursor.unwrap_or(mouse::Interaction::Grab);
         }
         self.content.as_widget().mouse_interaction(&tree.children[0], layout, cursor, viewport, renderer)
     }

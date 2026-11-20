@@ -12,7 +12,7 @@ use folia_store::{ReplayGainMode, ThemeMode, ThemeSource};
 use folia_visualizer::{Ease, QuickControl, QuickKind, Style};
 use iced::widget::text::LineHeight;
 use iced::widget::{button, column, container, image, mouse_area, row, shader, slider, space, stack, tooltip};
-use iced::{Alignment, Background, Border, Color, Element, Length, Size, Task, Theme as IcedTheme};
+use iced::{Alignment, Background, Border, Color, Element, Length, Size, Task, Theme as IcedTheme, mouse};
 use lucide_static_svg::Icon;
 
 use crate::icons::{Variant, icon, variant};
@@ -57,6 +57,8 @@ pub enum Tab {
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    Catalog(crate::catalog::Message),
+    TransparentBackground(bool),
     Toggle,
     /// Escape: the open panel closes and stays on the player page.
     Close,
@@ -78,6 +80,7 @@ pub enum Message {
     Home,
     Locate,
     Settings,
+    Scene,
     Theme(ThemeMode),
     Picker(mode_picker::Message),
     Intensity,
@@ -106,6 +109,7 @@ pub enum Message {
     EqualizerOpen,
     /// The theme source's segments and the quick editor.
     ThemeSource(folia_store::ThemeSource),
+    GenerateTheme,
     QuickEditOpen,
     /// The lyric tab's buttons.
     MatchOnline,
@@ -122,11 +126,15 @@ pub enum Message {
 }
 
 pub enum Effect {
+    Catalog(crate::catalog::Message),
+    Background(folia_visualizer::Background),
+    TransparentBackground(bool),
     None,
     Home,
     Locate,
     Settings,
     Workbench,
+    Scene,
     Playback(playback::Message),
     Intensity,
     Theme(ThemeMode),
@@ -143,6 +151,7 @@ pub enum Effect {
     PoolToggle(String),
     EqualizerOpen,
     ThemeSource(folia_store::ThemeSource),
+    GenerateTheme,
     QuickEditOpen,
     MatchOnline,
     LyricFileOpen,
@@ -395,11 +404,19 @@ impl PlayerPanel {
     }
 
     pub fn animating(&self, now: Instant) -> bool {
+        self.controls_animating(now) || self.visualizing()
+    }
+
+    pub(crate) fn visualizing(&self) -> bool {
+        self.open && self.pickers.visualizing()
+    }
+
+    pub(crate) fn controls_animating(&self, now: Instant) -> bool {
         [self.surface, self.handle, self.handle_tone, self.handle_hover, self.grow, self.page, self.like_swap]
             .iter()
             .chain(&self.fold)
             .any(|tween| tween.running(now))
-            || (self.open && self.pickers.animating(now))
+            || (self.open && self.pickers.controls_animating(now))
             || self.quality.animating(now)
             || (self.open && self.tab == Tab::Queue && self.queue.animating(now))
     }
@@ -483,10 +500,16 @@ impl PlayerPanel {
                 self.set_open(false, now);
                 Effect::Settings
             }
+            Message::Scene => {
+                self.set_open(false, now);
+                Effect::Scene
+            }
             Message::Theme(mode) => Effect::Theme(*mode),
-            Message::Picker(message) => match self.pickers.update(message.clone(), style_id, now) {
+            Message::TransparentBackground(enabled) => Effect::TransparentBackground(*enabled),
+            Message::Picker(message) => match self.pickers.update(message.clone(), style_id, room.background, now) {
                 mode_picker::Outcome::None => Effect::None,
                 mode_picker::Outcome::Style(style) => Effect::Visualizer(style),
+                mode_picker::Outcome::Background(background) => Effect::Background(background),
                 mode_picker::Outcome::Settings => {
                     self.set_open(false, now);
                     Effect::Workbench
@@ -511,6 +534,7 @@ impl PlayerPanel {
             Message::Like => Effect::Like,
             Message::AddToPlaylist => Effect::AddToPlaylist,
             Message::CopySongInfo => Effect::CopySongInfo,
+            Message::Catalog(message) => Effect::Catalog(message.clone()),
             Message::Quick(key) => Effect::Quick(key),
             Message::Reroll => Effect::Reroll,
             Message::PoolOpen => {
@@ -524,6 +548,7 @@ impl PlayerPanel {
             Message::PoolToggle(style) => Effect::PoolToggle(style.clone()),
             Message::EqualizerOpen => Effect::EqualizerOpen,
             Message::ThemeSource(source) => Effect::ThemeSource(*source),
+            Message::GenerateTheme => Effect::GenerateTheme,
             Message::QuickEditOpen => Effect::QuickEditOpen,
             Message::MatchOnline => Effect::MatchOnline,
             Message::LyricFileOpen => Effect::LyricFileOpen,
@@ -650,6 +675,7 @@ impl PlayerPanel {
 /// What the panel's update needs of the window and the queue.
 #[derive(Clone, Copy)]
 pub struct Room<'a> {
+    pub background: folia_visualizer::Background,
     pub width: f32,
     pub height: f32,
     pub bottom: f32,
@@ -668,6 +694,7 @@ pub struct View<'a> {
     pub width: f32,
     pub height: f32,
     pub track: Option<&'a Track>,
+    pub catalog: folia_omni::Capabilities,
     pub queue: &'a [Track],
     pub index: Option<usize>,
     pub volume: f32,
@@ -678,6 +705,7 @@ pub struct View<'a> {
     pub bottom: f32,
     pub repeat: Repeat,
     pub style_id: &'a str,
+    pub scene: Option<folia_core::SceneId>,
     pub has_lyrics: bool,
     /// `lyricsFontScale`, for the style pictures.
     pub font_scale: f32,
@@ -688,6 +716,8 @@ pub struct View<'a> {
     pub pill_hover: bool,
     /// The track's platform, and that platform's cached account.
     pub platform: Option<Platform>,
+    /// Whether the account card, sign-in and account actions are available.
+    pub account_controls: bool,
     pub account: Option<&'a Account>,
     pub account_avatar: Option<&'a iced::widget::image::Handle>,
     pub syncing: bool,
@@ -706,19 +736,16 @@ pub struct View<'a> {
     /// The chosen style's own quick controls.
     pub quick: &'a [QuickControl],
     pub theme_source: ThemeSource,
+    pub transparent_background: bool,
+    /// The page is transparent through either the setting or applied system glass.
+    pub transparent_surface: bool,
     pub has_custom_theme: bool,
+    pub can_generate_theme: bool,
+    pub generating_theme: bool,
     /// The random pool (style ids), or every style when `None`.
     pub random_pool: Option<&'a [String]>,
     pub all_styles: &'a [Style],
     pub background: folia_visualizer::Background,
-    pub sora: folia_visualizer::SoraTuning,
-    pub monet: folia_visualizer::monet_background::Tuning,
-    pub nomand: folia_visualizer::nomand::Tuning,
-    pub picture: Option<&'a iced::widget::image::Handle>,
-    /// Geometric shapes of the common background.
-    pub background_shapes: bool,
-    /// Geometric edge vignette of the common background.
-    pub background_vignette: bool,
     pub equalizer_on: bool,
     pub replay_gain: ReplayGainMode,
     pub gain: Option<folia_core::ReplayGain>,
@@ -747,8 +774,9 @@ fn surface<'a>(panel: &'a PlayerPanel, view: View<'a>, open: f32, now: Instant) 
     let inner = (panel_w - 24.0).max(96.0);
     let max_h = (view.height - under - view.bottom - TOP_MARGIN).max(220.0);
     // The header and body heights move with the fold, between the cover tab and the last other tab.
-    let (big_h, _, cover_px) = measure(Tab::Cover, view.queue.len(), view.account.is_some(), inner, max_h, 0.0);
-    let body_of = |tab| measure(tab, view.queue.len(), view.account.is_some(), inner, max_h, panel.bodies.get(tab)).1;
+    let account = view.account_controls.then_some(view.account.is_some());
+    let (big_h, _, cover_px) = measure(Tab::Cover, view.queue.len(), account, inner, max_h, 0.0);
+    let body_of = |tab| measure(tab, view.queue.len(), account, inner, max_h, panel.bodies.get(tab)).1;
     let (from_body, to_body) = (body_of(panel.body_from), body_of(panel.body_tab));
     let full_body = from_body + (to_body - from_body) * panel.grow.value(now);
     let fold =
@@ -781,7 +809,7 @@ fn surface<'a>(panel: &'a PlayerPanel, view: View<'a>, open: f32, now: Instant) 
         shadow_y: SHADOW_Y,
         shadow_spread: 0.0,
         ring,
-        backdrop: 40.0,
+        backdrop: if view.transparent_surface { 0.0 } else { 40.0 },
         fade: open,
         saturate: 1.3,
     })
@@ -805,15 +833,9 @@ fn surface<'a>(panel: &'a PlayerPanel, view: View<'a>, open: f32, now: Instant) 
             open,
             audio: view.audio,
             background: view.background,
-            shapes: view.background_shapes,
-            vignette: view.background_vignette,
-            daylight: view.daylight,
-            sora: view.sora,
-            monet: view.monet,
-            picture: view.picture,
-            nomand: view.nomand,
         };
-        let mut place = picker_place(&view, panel.pickers.drawn(), Size::new(panel_w, visual_h), header_h);
+        let mut place =
+            picker_place(&view, panel.pickers.drawn(), Size::new(panel_w, view.height - visual_top), header_h);
         place.origin = (visual_left - x0, visual_top - y0);
         picker = panel.pickers.picker(look, place, now, view.modal);
     }
@@ -821,8 +843,7 @@ fn surface<'a>(panel: &'a PlayerPanel, view: View<'a>, open: f32, now: Instant) 
     if tab == Tab::Quality {
         // The account block (56 signed in, 44 for a guest row), the hairline and the 44px quality row, whose
         // trigger is 6px inside it. The menu is drawn over the face, as the mode pickers are.
-        let account_h = if view.account.is_some() { 56.0 } else { 44.0 };
-        let trigger_top = header_h + account_h + 56.0;
+        let trigger_top = header_h + quality_account_height(account) + 39.0;
         let place = quality_select::Place {
             window_height: view.height,
             window_top: visual_top,
@@ -990,10 +1011,17 @@ fn header<'a>(
         .on_press_maybe((view.track.is_some() && fold.under > 0.5).then_some(Message::CopySongInfo))
         .style(button::text),
         artists(view, big, 13.0, 20.0),
-        text(album)
-            .size(crate::typeface::size::HINT)
-            .line_height(LineHeight::Absolute(iced::Pixels(18.0)))
-            .color(big.t3),
+        button(
+            text(album)
+                .size(crate::typeface::size::HINT)
+                .line_height(LineHeight::Absolute(iced::Pixels(18.0)))
+                .color(big.t3)
+        )
+        .padding(0)
+        .on_press_maybe(
+            view.track.and_then(|track| crate::credits::album(track, view.catalog.albums)).map(Message::Catalog)
+        )
+        .style(button::text),
     ];
     let under = column![credits, actions(view, big, big_ink, swap)].padding(pad(14.0, 4.0, 0.0, 4.0));
 
@@ -1008,14 +1036,24 @@ fn header<'a>(
 }
 
 fn artists<'a>(view: View<'a>, tokens: Faded, size: f32, leading: f32) -> Element<'a, Message> {
-    let raw = view.track.and_then(|track| track.artist.as_deref()).unwrap_or("");
     let mut row = iced::widget::Row::new().spacing(0);
-    for (index, name) in raw.split(" / ").filter(|name| !name.is_empty()).enumerate() {
+    for (index, (name, action)) in view
+        .track
+        .map(|track| crate::credits::artists(track, view.catalog.artists))
+        .unwrap_or_default()
+        .into_iter()
+        .enumerate()
+    {
         if index > 0 {
             row = row
                 .push(text(" / ").size(size).line_height(LineHeight::Absolute(iced::Pixels(leading))).color(tokens.t3));
         }
-        row = row.push(text(name).size(size).line_height(LineHeight::Absolute(iced::Pixels(leading))).color(tokens.t2));
+        row = row.push(
+            button(text(name).size(size).line_height(LineHeight::Absolute(iced::Pixels(leading))).color(tokens.t2))
+                .padding(0)
+                .on_press_maybe(action.map(Message::Catalog))
+                .style(button::text),
+        );
     }
     row.into()
 }
@@ -1151,7 +1189,7 @@ fn dock<'a>(
         (Tab::Cover, view.i18n.t("panel.cover")),
         (Tab::Controls, view.i18n.t("panel.controls")),
         (Tab::Queue, view.i18n.t("panel.playlist")),
-        (Tab::Quality, view.i18n.t("panel.account")),
+        (Tab::Quality, view.i18n.t(if view.account_controls { "panel.account" } else { "account.audioQuality" })),
     ];
     if local {
         tabs.insert(1, (Tab::Source, view.i18n.t("localMusic.folder")));
@@ -1282,13 +1320,6 @@ fn controls<'a>(view: View<'a>, tokens: Faded, ink: Color, rows: Rows<'a>) -> El
         open: ink.a,
         audio: view.audio,
         background: view.background,
-        shapes: view.background_shapes,
-        vignette: view.background_vignette,
-        daylight: view.daylight,
-        sora: view.sora,
-        monet: view.monet,
-        picture: view.picture,
-        nomand: view.nomand,
     };
     let intensity = view.i18n.t(intensity_key(view.theme.intensity));
     let intensity_tip = format!("{}: {}", view.i18n.t("ui.animationIntensity"), intensity);
@@ -1320,22 +1351,41 @@ fn controls<'a>(view: View<'a>, tokens: Faded, ink: Color, rows: Rows<'a>) -> El
         .padding(pad(4.0, 0.0, 0.0, 0.0))
     });
     let background = pickers.row(look, mode_picker::Row::Background, None, now);
+    let scene = mouse_area(
+        container(
+            row![
+                text(view.i18n.t("ui.scene"))
+                    .size(crate::typeface::size::BODY)
+                    .color(fade(tokens.t2, ink.a))
+                    .width(Length::Fill),
+                text(view.i18n.t(if view.scene.is_some() { "ui.sceneCinema" } else { "ui.sceneNone" }))
+                    .size(crate::typeface::size::BODY)
+                    .color(fade(tokens.t2, ink.a)),
+                icon(Icon::ChevronRight, 15.0, fade(tokens.t2, ink.a)),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        )
+        .height(44)
+        .align_y(Alignment::Center),
+    )
+    .on_press(Message::Scene)
+    .interaction(mouse::Interaction::Pointer);
     let transparent = row![
         container(
-            tooltip(
-                text(view.i18n.t("options.transparentPlayerBackground"))
-                    .size(crate::typeface::size::BODY)
-                    .color(fade(tokens.t2, ink.a * 0.4)),
-                text(view.i18n.t("options.transparentPlayerBackgroundUnavailable")).size(crate::typeface::size::HINT),
-                tooltip::Position::Top,
-            )
-            .style(tokens.tip())
+            text(view.i18n.t("options.transparentPlayerBackground"))
+                .size(crate::typeface::size::BODY)
+                .color(fade(tokens.t2, ink.a))
         )
         .width(Length::Fill),
-        off_switch(tokens),
+        crate::settings_kit::toggle(
+            tokens.tokens(),
+            if view.transparent_background { 1.0 } else { 0.0 },
+            Message::TransparentBackground(!view.transparent_background)
+        ),
     ]
     .align_y(Alignment::Center)
-    .height(Length::Fixed(44.0));
+    .height(44);
     let track = tokens.fill;
     let custom = view.theme_source == ThemeSource::Custom && view.has_custom_theme;
     let choices = container(
@@ -1347,7 +1397,13 @@ fn controls<'a>(view: View<'a>, tokens: Faded, ink: Color, rows: Rows<'a>) -> El
                 view.theme_source == ThemeSource::Default,
                 Some(Message::ThemeSource(ThemeSource::Default))
             ),
-            source_seg(tokens, ink, view.i18n.t("ui.aiTheme"), false, Some(view.i18n.t("ui.aiThemeUnavailable")),),
+            source_seg_press(
+                tokens,
+                ink,
+                view.i18n.t("ui.aiTheme"),
+                view.theme_source == ThemeSource::Ai,
+                Some(Message::ThemeSource(ThemeSource::Ai))
+            ),
             source_seg_press(
                 tokens,
                 ink,
@@ -1368,7 +1424,8 @@ fn controls<'a>(view: View<'a>, tokens: Faded, ink: Color, rows: Rows<'a>) -> El
         border: Border { radius: 8.0.into(), ..Border::default() },
         ..container::Style::default()
     });
-    let palette_tip = if custom {
+    let editable = custom || view.theme_source == ThemeSource::Ai;
+    let palette_tip = if editable {
         view.i18n.t("options.customThemeQuickEditTitle").to_owned()
     } else {
         view.i18n.t("options.themeQuickEditUnavailable").to_owned()
@@ -1379,15 +1436,15 @@ fn controls<'a>(view: View<'a>, tokens: Faded, ink: Color, rows: Rows<'a>) -> El
             tokens,
             Icon::Palette,
             (15.0, 28.0),
-            if custom { fade(tokens.t2, ink.a) } else { fade(tokens.t2, ink.a * 0.4) },
+            if editable { fade(tokens.t2, ink.a) } else { fade(tokens.t2, ink.a * 0.4) },
             Some(tokens.fill),
             palette_tip,
-            custom.then_some(Message::QuickEditOpen)
+            editable.then_some(Message::QuickEditOpen)
         ),
     ]
     .spacing(6)
     .align_y(Alignment::Center);
-    let theme_name = if view.theme_source == ThemeSource::Custom {
+    let theme_name = if view.theme_source != ThemeSource::Default {
         view.theme.name.to_string()
     } else if view.daylight {
         view.i18n.t("theme.daylightDefault").to_owned()
@@ -1397,7 +1454,11 @@ fn controls<'a>(view: View<'a>, tokens: Faded, ink: Color, rows: Rows<'a>) -> El
     let name_row = row![
         text(theme_name).size(crate::typeface::size::CONTROL).color(fade(tokens.t2, ink.a)).width(Length::Fill),
         day_night(tokens, ink, view.daylight),
-        text_btn(view.i18n.t("ui.generateAITheme"), fade(tokens.t2, ink.a * 0.4), None),
+        text_btn(
+            view.i18n.t(if view.generating_theme { "ui.generatingTheme" } else { "ui.generateAITheme" }),
+            fade(tokens.t2, ink.a * if view.can_generate_theme { 1.0 } else { 0.4 }),
+            view.can_generate_theme.then_some(Message::GenerateTheme)
+        ),
     ]
     .spacing(6)
     .align_y(Alignment::Center);
@@ -1408,7 +1469,7 @@ fn controls<'a>(view: View<'a>, tokens: Faded, ink: Color, rows: Rows<'a>) -> El
     if let Some(random) = random {
         column = column.push(random);
     }
-    column.push(background).push(transparent).push(hairline(tokens)).push(sources).push(name_row).into()
+    column.push(background).push(transparent).push(scene).push(hairline(tokens)).push(sources).push(name_row).into()
 }
 
 /// `renderQuickControls`: the style's own chips and toggles under its row.
@@ -1718,6 +1779,14 @@ fn quality_tab<'a>(
     select: &'a quality_select::Select,
     now: Instant,
 ) -> Element<'a, Message> {
+    let quality = labeled(
+        ink,
+        view.i18n.t("account.audioQuality"),
+        select.trigger(view.i18n, tokens.tokens(), ink, view.quality, now),
+    );
+    if !view.account_controls {
+        return quality;
+    }
     let account = match (view.platform, view.account) {
         (Some(platform), Some(account)) => account_card(view, platform, account, tokens, ink),
         _ => labeled(
@@ -1734,18 +1803,7 @@ fn quality_tab<'a>(
         space().height(0).into()
     };
     let line = container(hairline(tokens)).padding(pad(8.0, 4.0, 8.0, 4.0));
-    column![
-        account,
-        line,
-        labeled(
-            ink,
-            view.i18n.t("account.audioQuality"),
-            select.trigger(view.i18n, tokens.tokens(), ink, view.quality, now)
-        ),
-        sync,
-    ]
-    .spacing(0)
-    .into()
+    column![account, line, quality, sync].spacing(0).into()
 }
 
 /// `AccountTab`'s signed-in card: a 40px face with the platform's mark on its corner, the name and the member crown,
@@ -1888,7 +1946,7 @@ fn handle_button<'a>(view: View<'a>, look: HandleLook) -> Element<'a, Message> {
         shadow_y: 0.0,
         shadow_spread: 0.0,
         ring: [0.0; 4],
-        backdrop: 12.0,
+        backdrop: if view.transparent_surface { 0.0 } else { 12.0 },
         fade: alpha,
         saturate: 1.0,
     })
@@ -2117,27 +2175,6 @@ fn source_seg_press<'a>(
         .into()
 }
 
-fn source_seg<'a>(tokens: Faded, ink: Color, label: &'a str, on: bool, tip: Option<&'a str>) -> Element<'a, Message> {
-    let label =
-        text(label).size(crate::typeface::size::CONTROL).color(if on { ink } else { fade(tokens.t2, ink.a * 0.4) });
-    let button = button(container(label).center_x(Length::Fill).center_y(Length::Fill))
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .padding(0)
-        .on_press_maybe(None)
-        .style(move |_theme: &IcedTheme, _status| button::Style {
-            background: on.then_some(Background::Color(tokens.raise)),
-            border: Border { radius: 6.0.into(), ..Border::default() },
-            ..button::Style::default()
-        });
-    match tip {
-        Some(tip) => tooltip(button, text(tip).size(crate::typeface::size::HINT), tooltip::Position::Top)
-            .style(tokens.tip())
-            .into(),
-        None => button.into(),
-    }
-}
-
 fn day_night<'a>(tokens: Faded, ink: Color, daylight: bool) -> Element<'a, Message> {
     let track = tokens.fill;
     let one = |lucide: Icon, on: bool, message: Message| {
@@ -2169,24 +2206,6 @@ fn day_night<'a>(tokens: Faded, ink: Color, daylight: bool) -> Element<'a, Messa
         .into()
 }
 
-fn off_switch<'a>(tokens: Faded) -> Element<'a, Message> {
-    let knob = container(space()).width(18).height(18).style(move |_theme: &IcedTheme| container::Style {
-        background: Some(tokens.knob.into()),
-        border: Border { radius: 9.0.into(), ..Border::default() },
-        ..container::Style::default()
-    });
-    container(knob)
-        .width(40)
-        .height(24)
-        .padding(pad(3.0, 0.0, 0.0, 3.0))
-        .style(move |_theme: &IcedTheme| container::Style {
-            background: Some(fade(tokens.track, 0.4).into()),
-            border: Border { radius: 12.0.into(), ..Border::default() },
-            ..container::Style::default()
-        })
-        .into()
-}
-
 fn fade(color: Color, open: f32) -> Color {
     Color { a: color.a * open, ..color }
 }
@@ -2203,7 +2222,14 @@ fn shown_tab(tab: Tab, local: bool, online: bool) -> Tab {
 }
 
 /// `measured` is the tab body's laid-out height; 0 falls back to the estimate below.
-fn measure(tab: Tab, queue_len: usize, signed: bool, inner: f32, max_h: f32, measured: f32) -> (f32, f32, f32) {
+fn measure(
+    tab: Tab,
+    queue_len: usize,
+    account: Option<bool>,
+    inner: f32,
+    max_h: f32,
+    measured: f32,
+) -> (f32, f32, f32) {
     let under = 14.0 + 26.0 + 20.0 + 18.0 + 14.0 + 32.0;
     let room = (max_h - 24.0 - 12.0 - 36.0).max(under + 96.0);
     let cover_px = (room - under).clamp(96.0, inner);
@@ -2215,7 +2241,7 @@ fn measure(tab: Tab, queue_len: usize, signed: bool, inner: f32, max_h: f32, mea
         Tab::Controls => 460.0,
         Tab::Queue => 36.0 + queue_island::list_height(queue_len),
         Tab::Source => 210.0,
-        Tab::Quality => quality_body(signed),
+        Tab::Quality => quality_body(account),
         Tab::Cover => 0.0,
     };
     let chrome = 24.0 + 48.0 + body + 12.0 + 36.0;
@@ -2225,10 +2251,17 @@ fn measure(tab: Tab, queue_len: usize, signed: bool, inner: f32, max_h: f32, mea
 
 /// `AccountTab`: the account block, the group line's 8px above and below, the 44px quality row and the
 /// 48px sync row.
-fn quality_body(signed: bool) -> f32 {
-    let account = if signed { 56.0 } else { 44.0 };
-    let sync = if signed { 48.0 } else { 0.0 };
-    account + 17.0 + 44.0 + sync
+fn quality_body(account: Option<bool>) -> f32 {
+    let sync = if account == Some(true) { 48.0 } else { 0.0 };
+    quality_account_height(account) + 44.0 + sync
+}
+
+fn quality_account_height(account: Option<bool>) -> f32 {
+    match account {
+        Some(true) => 56.0 + 17.0,
+        Some(false) => 44.0 + 17.0,
+        None => 0.0,
+    }
 }
 
 /// The queue list's height: what `measure` leaves the queue tab under its 36px head.
@@ -2237,7 +2270,7 @@ fn queue_list_h(width: f32, height: f32, bottom: f32, chrome: bool, len: usize) 
     let panel_w = (width - 32.0).clamp(200.0, 360.0);
     let inner = (panel_w - 24.0).max(96.0);
     let max_h = (height - under - bottom - TOP_MARGIN).max(220.0);
-    let (_, body, _) = measure(Tab::Queue, len, false, inner, max_h, 0.0);
+    let (_, body, _) = measure(Tab::Queue, len, None, inner, max_h, 0.0);
     queue_island::list_height(len).min((body - 21.0 - 36.0).max(0.0))
 }
 
@@ -2258,11 +2291,5 @@ fn picker_place(view: &View<'_>, row: Option<mode_picker::Row>, size: Size, head
         Some(mode_picker::Row::Background) => style_top + mode_picker::ROW_H + 8.0 + params,
         _ => style_top,
     };
-    mode_picker::Place {
-        width: size.width,
-        height: size.height,
-        trigger_top: top,
-        trigger_bottom: top + 48.0,
-        origin: (0.0, 0.0),
-    }
+    mode_picker::Place { width: size.width, height: size.height, trigger_bottom: top + 48.0, origin: (0.0, 0.0) }
 }

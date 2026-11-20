@@ -35,14 +35,25 @@ pub fn bar<'a>(_home: &'a HomeChrome, host: &Host<'a>, _now: Instant) -> Element
 fn strip<'a>(host: &Host<'a>) -> Element<'a, Message> {
     let horizontal = host.horizontal;
     let ink = fade(host.text, host.opacity);
-    let paper = mix_paper(host);
+    let paper = if host.wall.seam_clear { host.background } else { mix_paper(host) };
     let ring = Color { a: if host.daylight { 0.08 } else { 0.06 }, ..ink };
     let (origin, size) = plate_box(host);
     let plate = Plate {
         radius: 0.0,
         fill_origin: origin,
         fill_size: size,
-        fill: [paper.r, paper.g, paper.b, 1.0],
+        fill: [
+            paper.r,
+            paper.g,
+            paper.b,
+            if host.wall.seam_clear {
+                if host.wall.backdrop_blur { 0.5 } else { 0.64 }
+            } else if host.wall.look != folia_store::WallLook::Solid {
+                0.8
+            } else {
+                1.0
+            },
+        ],
         shadow: seam_shadow(host),
         shadow_blur: SHADOW,
         shadow_y: 24.0,
@@ -1315,7 +1326,15 @@ fn tab_button<'a>(host: &Host<'a>) -> Element<'a, Message> {
     } else {
         iced::border::Radius::default().top_left(6.0).bottom_left(6.0)
     };
-    let label = tracked_col(super::tr(host, "libraryBravais.homeTitle"), 13.0, 0.12, ink);
+    let label = if host.tab_hidden {
+        let glyph = if host.horizontal || host.seam.before { Icon::PanelLeftOpen } else { Icon::PanelRightOpen };
+        row![icon(glyph, 16.0, ink), text(super::tr(host, "libraryBravais.seamRestore")).size(13).color(ink)]
+            .spacing(6)
+            .align_y(Alignment::Center)
+            .into()
+    } else {
+        tracked_col(super::tr(host, "libraryBravais.homeTitle"), 13.0, 0.12, ink)
+    };
     let face = container(label).padding([14.0, 8.0]).style(move |_theme: &Theme| container::Style {
         background: Some(Background::Color(paper)),
         border: Border { radius, ..Border::default() },
@@ -1348,7 +1367,7 @@ fn tool_grid<'a>(ink: Color) -> Element<'a, Message> {
         ]
         .spacing(8),
         row![
-            tool(Icon::PanelsTopLeft, 40.0, ink, None, true),
+            tool(Icon::PanelsTopLeft, 40.0, ink, Some(Message::Destination), false),
             tool(Icon::Ellipsis, 40.0, ink, Some(Message::More), false),
         ]
         .spacing(8),
@@ -1362,7 +1381,7 @@ fn tool_column<'a>(ink: Color) -> Element<'a, Message> {
     column![
         tool(Icon::Search, 36.0, ink, Some(Message::Search), false),
         tool(Icon::Settings, 36.0, ink, Some(Message::Settings), false),
-        tool(Icon::PanelsTopLeft, 36.0, ink, None, true),
+        tool(Icon::PanelsTopLeft, 36.0, ink, Some(Message::Destination), false),
         tool(Icon::Ellipsis, 36.0, ink, Some(Message::More), false),
     ]
     .spacing(6)
@@ -1375,7 +1394,7 @@ fn tool_row<'a>(ink: Color, spine: bool) -> Element<'a, Message> {
     row![
         tool(Icon::Search, box_px, ink, Some(Message::Search), false),
         tool(Icon::Settings, box_px, ink, Some(Message::Settings), false),
-        tool(Icon::PanelsTopLeft, box_px, ink, None, true),
+        tool(Icon::PanelsTopLeft, box_px, ink, Some(Message::Destination), false),
         tool(Icon::Ellipsis, box_px, ink, Some(Message::More), false),
     ]
     .spacing(6)
@@ -1689,10 +1708,26 @@ fn album_poster<'a>(host: &Host<'a>, seam: &super::LayerSeam, album: &super::Alb
     let facts_ink = fade(paper, facts_in.0);
     let dot = || text("·").size(crate::typeface::size::BODY).color(fade(facts_ink, 0.5));
     if !album.artists.is_empty() {
-        let name = text(album.artists.clone())
-            .size(crate::typeface::size::POSTER_ARTIST)
-            .font(crate::typeface::adapt(crate::typeface::BLACK))
-            .color(facts_ink);
+        let label = |name| {
+            text(name)
+                .size(crate::typeface::size::POSTER_ARTIST)
+                .font(crate::typeface::adapt(crate::typeface::BLACK))
+                .color(facts_ink)
+        };
+        let name: Element<'a, Message> = if album.artist_links.is_empty() {
+            label(album.artists.clone()).into()
+        } else {
+            row(album.artist_links.iter().map(|(name, id)| {
+                button(label(name.clone()))
+                    .padding(0)
+                    .on_press(Message::Catalog(crate::catalog::Message::OpenArtist(id.clone())))
+                    .style(button::text)
+                    .into()
+            }))
+            .spacing(8)
+            .wrap()
+            .into()
+        };
         let rule = container(space()).width(Length::Fill).height(Length::Fixed(2.0)).style(move |_theme: &Theme| {
             container::Style { background: Some(Background::Color(facts_ink)), ..container::Style::default() }
         });

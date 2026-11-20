@@ -15,7 +15,7 @@ use parking_lot::Mutex;
 
 use crate::blur::{self, Pyramid};
 
-const COVERS: &str = include_str!("../shaders/covers.wgsl");
+const COVERS: &str = concat!(include_str!("../shaders/poster_color.wgsl"), include_str!("../shaders/covers.wgsl"));
 const MAX_SIDE: u32 = 256;
 const ATLAS_LIMIT: u32 = 2048;
 
@@ -29,6 +29,7 @@ pub struct Quad {
     pub color1: [f32; 4],
     /// 0 poster shade, 1 mosaic shade, 2 no shade.
     pub shade: f32,
+    pub hover_filter: f32,
     pub alpha: f32,
 }
 
@@ -252,7 +253,11 @@ impl PublisherGuard {
         self.0.store(alive, Ordering::Relaxed);
         publishers.retain(|publisher| publisher.strong_count() > 0);
         if !publishers.iter().filter_map(Weak::upgrade).any(|publisher| publisher.load(Ordering::Relaxed)) {
-            lock_stage().owned = None;
+            let mut stage = lock_stage();
+            stage.owned = None;
+            if let Some(blit) = &mut stage.blit {
+                blit.foreground = None;
+            }
         }
     }
 }
@@ -331,6 +336,29 @@ pub fn copy_underlay(
 pub fn release_underlay() {
     let mut stage = lock_stage();
     stage.owned = None;
+    if let Some(blit) = &mut stage.blit {
+        blit.foreground = None;
+    }
+}
+
+/// Releases cached sampling references when the owner replaces or drops a scene texture.
+pub fn release_source(view: &wgpu::TextureView) {
+    let mut stage = lock_stage();
+    if let Some(blit) = &mut stage.blit
+        && blit.foreground.as_ref().is_some_and(|(source, _)| source == view)
+    {
+        blit.foreground = None;
+    }
+    if let Some(gpu) = &mut stage.gpu {
+        gpu.pyramid.release_source(view);
+    }
+}
+
+#[cfg(feature = "dev")]
+pub fn foreground_held() -> bool {
+    let stage = lock_stage();
+    stage.blit.as_ref().is_some_and(|blit| blit.foreground.is_some())
+        || stage.gpu.as_ref().is_some_and(|gpu| gpu.pyramid.copy_held())
 }
 
 /// Draws the copied background into `target`. `false` when this frame has none.
@@ -385,10 +413,13 @@ pub fn trim() {
         return;
     }
     stage.idle = stage.idle.saturating_add(1);
-    if stage.idle == 2
-        && let Some(gpu) = stage.gpu.as_mut()
-    {
-        gpu.release();
+    if stage.idle == 2 {
+        if let Some(gpu) = stage.gpu.as_mut() {
+            gpu.release();
+        }
+        if let Some(blit) = &mut stage.blit {
+            blit.foreground = None;
+        }
         tracing::debug!(bytes = 0, "backdrop textures released");
     }
 }
@@ -423,6 +454,9 @@ pub fn paint_external(
     gpu.stamp = stamp;
     gpu.levels.clear();
     gpu.levels.extend_from_slice(levels);
+    if let Some(blit) = &mut stage.blit {
+        blit.foreground = None;
+    }
     #[cfg(feature = "dev")]
     EXTERNAL_PAINTS.fetch_add(1, Ordering::Relaxed);
 }
@@ -466,6 +500,9 @@ pub fn paint_over_underlay(
     }
     let ready = stage.owned.as_ref().is_some_and(|owned| owned.ready);
     if ready {
+        if let Some(gpu) = stage.gpu.as_mut() {
+            gpu.pyramid.clear_copy();
+        }
         let (width, height) = blur::source_size(window[0] as u32, window[1] as u32);
         let source = stage.gpu.as_ref().and_then(|gpu| gpu.pyramid.source().cloned());
         let ground = stage.owned.as_ref().map(|owned| owned.bind.clone());
@@ -520,6 +557,9 @@ pub fn paint_over_underlay(
         }
     } else if let Some(gpu) = stage.gpu.as_mut() {
         gpu.pyramid.copy_into_source(device, encoder, foreground);
+        if let Some(blit) = &mut stage.blit {
+            blit.foreground = None;
+        }
     }
     let Some(gpu) = stage.gpu.as_mut() else { return };
     gpu.pyramid.blur(device, encoder, levels);
@@ -551,6 +591,10 @@ pub fn draw_source(
         return false;
     }
     let Some(source) = gpu.pyramid.source().cloned() else { return false };
+    gpu.pyramid.clear_copy();
+    if let Some(blit) = &mut stage.blit {
+        blit.foreground = None;
+    }
     let (width, height) = blur::source_size(window[0] as u32, window[1] as u32);
     drop(stage);
     draw(&source, width, height);
@@ -598,7 +642,7 @@ struct Blit {
     layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     format: wgpu::TextureFormat,
-    foreground: Option<(usize, wgpu::BindGroup)>,
+    foreground: Option<(wgpu::TextureView, wgpu::BindGroup)>,
     veil: wgpu::RenderPipeline,
     veil_uniform: wgpu::Buffer,
     veil_bind: wgpu::BindGroup,
@@ -687,9 +731,8 @@ impl Blit {
     }
 
     fn foreground(&mut self, device: &wgpu::Device, view: &wgpu::TextureView) -> wgpu::BindGroup {
-        let key = view as *const wgpu::TextureView as usize;
         if let Some((held, bind)) = &self.foreground
-            && *held == key
+            && held == view
         {
             return bind.clone();
         }
@@ -701,7 +744,7 @@ impl Blit {
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
             ],
         });
-        self.foreground = Some((key, bind.clone()));
+        self.foreground = Some((view.clone(), bind.clone()));
         bind
     }
 }
@@ -926,7 +969,13 @@ impl Picture {
             let uv =
                 self.places.get(quad.image as usize).copied().map(|place| map_uv(place, quad.uv)).unwrap_or(quad.uv);
             let mode = if quad.image == u32::MAX { 0.0 } else { 1.0 };
-            push_quad(&mut verts, quad.rect, uv, [quad.color0, quad.color1], [quad.shade, quad.alpha, mode, 0.0]);
+            push_quad(
+                &mut verts,
+                quad.rect,
+                uv,
+                [quad.color0, quad.color1],
+                [quad.shade, quad.alpha, mode, quad.hover_filter],
+            );
         }
         let bytes = bytemuck::cast_slice(&verts);
         let needed = bytes.len() as u64;
@@ -1180,6 +1229,7 @@ fn sample_wall(width: f32, height: f32) -> Scene {
     for (index, color) in tiles.iter().enumerate() {
         let x = 40.0 + index as f32 * (side + 16.0);
         quads.push(Quad {
+            hover_filter: 0.0,
             rect: [x, y, side, side],
             uv: [0.0, 0.0, 1.0, 1.0],
             image: u32::MAX,
@@ -1189,6 +1239,7 @@ fn sample_wall(width: f32, height: f32) -> Scene {
             alpha: 1.0,
         });
         quads.push(Quad {
+            hover_filter: 0.0,
             rect: [x + 24.0, y + side - 48.0, side - 48.0, 14.0],
             uv: [0.0; 4],
             image: u32::MAX,

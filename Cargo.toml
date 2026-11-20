@@ -4,16 +4,25 @@ members = ["crates/*"]
 exclude = ["test", "crates/cryoglyph"]
 
 [workspace.package]
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 rust-version = "1.99"
 license = "AGPL-3.0-only"
 repository = "https://github.com/Techuouo520/Folia-rust"
 
 [workspace.dependencies]
+bytes = "1.12.1"
+futures-util = { version = "0.3.34", features = ["sink"] }
+rumqttc = { version = "=0.25.1", default-features = false }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-platform-verifier = "=0.7.1"
+tokio-tungstenite = { version = "=0.30.0", default-features = false, features = ["connect", "rustls-tls-native-roots"] }
 unicode-script = "0.5.8"
 unicode-vo = "0.1.0"
 folia-core = { path = "crates/folia-core" }
+folia-media = { path = "crates/folia-media" }
+folia-ai = { path = "crates/folia-ai" }
+folia-acoustics = { path = "crates/folia-acoustics" }
 folia-store = { path = "crates/folia-store" }
 folia-i18n = { path = "crates/folia-i18n" }
 folia-ui = { path = "crates/folia-ui" }
@@ -24,15 +33,16 @@ folia-player = { path = "crates/folia-player" }
 folia-visualizer = { path = "crates/folia-visualizer" }
 folia-render = { path = "crates/folia-render" }
 folia-memory = { path = "crates/folia-memory" }
+folia-analysis = { path = "crates/folia-analysis" }
 
 aes = "=0.8.4"
+chacha20 = "=0.10.2"
 anyhow = "1.0.104"
 base64 = "0.23.1"
 bytemuck = "1.25.2"
 parking_lot = "0.12.5"
 wgpu = "27.0.1"
 cpal = "0.18.2"
-device_query = "4.0.1"
 directories = "6.0.0"
 encoding_rs = "0.8.44"
 flate2 = "=1.1.10"
@@ -49,6 +59,7 @@ librespot-audio = { version = "=0.8.0", default-features = false, features = ["r
 librespot-core = { version = "=0.8.0", default-features = false, features = ["rustls-tls-webpki-roots"] }
 librespot-metadata = { version = "=0.8.0", default-features = false, features = ["rustls-tls-webpki-roots"] }
 lofty = "0.25.5"
+libloading = "0.9.1"
 lucide-static-svg = "1.65.0"
 md-5 = "=0.10.6"
 num-bigint = "=0.4.8"
@@ -72,12 +83,15 @@ sys-locale = "0.3.2"
 sysinfo = { version = "=0.36.1", default-features = false, features = ["system"] }
 thiserror = "2.0.21"
 tokio = { version = "1.54.1", default-features = false, features = ["sync", "rt", "time", "net", "macros"] }
+url = "2.5.8"
+zbus = { version = "5.19.0", default-features = false, features = ["tokio"] }
 toml = "1.1.8"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 walkdir = "2.5.0"
 winresource = { version = "0.1.34", default-features = false }
 winit = "=0.30.13"
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_System_Threading", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 zhconv = "0.4.2"
 
 [workspace.lints.rust]

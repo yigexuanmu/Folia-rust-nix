@@ -53,6 +53,7 @@ fn closing_the_panel_takes_every_pixel_back_to_the_page() {
     let theme = Theme::MIDNIGHT;
     let empty: Vec<folia_core::Track> = Vec::new();
     let room = || PanelRoom {
+        background: folia_visualizer::Background::Latent,
         width: 1200.0,
         height: 800.0,
         bottom: 32.0,
@@ -87,6 +88,7 @@ fn closing_the_panel_takes_every_pixel_back_to_the_page() {
 
 pub(super) fn panel_view<'a>(i18n: &'a I18n, theme: &'a Theme, queue: &'a [folia_core::Track]) -> PanelView<'a> {
     PanelView {
+        catalog: folia_omni::Capabilities::default(),
         i18n,
         theme,
         daylight: false,
@@ -101,6 +103,7 @@ pub(super) fn panel_view<'a>(i18n: &'a I18n, theme: &'a Theme, queue: &'a [folia
         bottom: 32.0,
         repeat: Repeat::Off,
         style_id: "classic",
+        scene: None,
         has_lyrics: false,
         font_scale: 1.0,
         drawn_style: Style::Classic,
@@ -108,6 +111,7 @@ pub(super) fn panel_view<'a>(i18n: &'a I18n, theme: &'a Theme, queue: &'a [folia
         art: None::<&Handle>,
         pill_hover: false,
         platform: None,
+        account_controls: true,
         account: None,
         account_avatar: None,
         syncing: false,
@@ -121,16 +125,14 @@ pub(super) fn panel_view<'a>(i18n: &'a I18n, theme: &'a Theme, queue: &'a [folia
         add_disabled: None,
         quick: &[],
         theme_source: ThemeSource::Default,
+        transparent_background: false,
+        transparent_surface: false,
         has_custom_theme: false,
+        can_generate_theme: false,
+        generating_theme: false,
         random_pool: None,
         all_styles: &Style::ALL,
         background: folia_visualizer::Background::Latent,
-        sora: folia_visualizer::SoraTuning::DEFAULT,
-        monet: folia_visualizer::monet_background::Tuning::DEFAULT,
-        picture: None,
-        nomand: folia_visualizer::nomand::Tuning::default(),
-        background_shapes: true,
-        background_vignette: true,
         equalizer_on: false,
         replay_gain: ReplayGainMode::default(),
         gain: None,
@@ -156,24 +158,106 @@ fn paint<M>(root: Element<'_, M>, size: Size, clear: Color) -> Vec<u8> {
     )
 }
 
+// Native service wording and concise workbench hints, in en/zh-CN/in/vi order.
+const NATIVE_LOCALE_COPY: &[(&str, [&str; 4])] = &[
+    (
+        "options.configureAiApiKey",
+        ["Open AI service settings", "前往 AI 服务设置", "Buka pengaturan layanan AI", "Mở cài đặt dịch vụ AI"],
+    ),
+    (
+        "options.enablePlayerPageNativeBlurDesc",
+        [
+            "Applies while the player background is opaque. Moving the window may be less smooth.",
+            "在播放页的非透明模式下生效，移动窗口时可能卡顿。",
+            "Berlaku saat latar pemutar tidak transparan. Pergerakan jendela mungkin kurang mulus.",
+            "Áp dụng khi nền trang phát không trong suốt. Di chuyển cửa sổ có thể kém mượt hơn.",
+        ],
+    ),
+    (
+        "options.gpuPreferenceCommandLineNotice",
+        [
+            "WGPU_POWER_PREF overrides the saved GPU preference for this session",
+            "本次启动设置了 WGPU_POWER_PREF，以环境变量指定的显卡偏好为准",
+            "WGPU_POWER_PREF menimpa preferensi GPU tersimpan untuk sesi ini",
+            "WGPU_POWER_PREF ghi đè lựa chọn GPU đã lưu trong phiên này",
+        ],
+    ),
+    (
+        "options.nativeBlurConfirmAction",
+        ["Enable system blur", "开启系统毛玻璃", "Aktifkan blur sistem", "Bật nền mờ hệ thống"],
+    ),
+    (
+        "options.nativeBlurConfirmDesc",
+        [
+            "The player will use a translucent system blur in place of the shared Folia background. This effect can increase rendering cost.",
+            "开启后，播放页将使用系统毛玻璃半透明背景，替换 Folia 的共用背景。该效果可能增加渲染开销。",
+            "Pemutar akan menggunakan blur sistem tembus pandang sebagai pengganti latar bersama Folia. Efek ini dapat meningkatkan biaya render.",
+            "Trang phát sẽ dùng nền mờ hệ thống bán trong suốt thay cho nền chung của Folia. Hiệu ứng này có thể tăng chi phí dựng hình.",
+        ],
+    ),
+    (
+        "options.smartBeatDesc_cached",
+        [
+            "Use saved beat and stem analysis. Tracks without saved results keep their original visuals.",
+            "使用已保存的节拍与音轨分析结果，未分析曲目保持原来的画面。",
+            "Gunakan analisis ketukan dan stem tersimpan. Lagu tanpa hasil tersimpan mempertahankan tampilan aslinya.",
+            "Dùng kết quả phân tích nhịp và stem đã lưu. Bài chưa có kết quả giữ hình ảnh gốc.",
+        ],
+    ),
+    (
+        "options.smartBeatDesc_off",
+        [
+            "Keep the original spectrum response in every visualizer.",
+            "所有画面保持原来的频谱响应。",
+            "Pertahankan respons spektrum asli pada semua visualizer.",
+            "Giữ phản ứng phổ âm gốc cho mọi kiểu hiển thị.",
+        ],
+    ),
+    (
+        "options.smartBeatDesc_on",
+        [
+            "Drive each enabled motion effect with musical analysis. Beat This! finds beats, and HTDemucs separates drums and vocals. Models run in the background when a visible effect needs them, and completed results are saved.",
+            "各歌词动画中的动感效果可独立开关和调节强度。Beat This! 识别节拍，HTDemucs 分离鼓声与人声。画面上有效果需要时才在后台分析，完整结果会保存供以后复用。",
+            "Gerakkan setiap efek aktif dengan analisis musik. Beat This! mencari ketukan, dan HTDemucs memisahkan drum serta vokal. Model berjalan di latar saat efek yang terlihat membutuhkannya. Hasil lengkap disimpan.",
+            "Điều khiển từng hiệu ứng đang bật bằng phân tích âm nhạc. Beat This! nhận diện nhịp, HTDemucs tách trống và giọng hát. Mô hình chạy nền khi hiệu ứng đang hiển thị cần dùng, và lưu kết quả hoàn chỉnh.",
+        ],
+    ),
+    (
+        "options.beatEffect_nebbiaDrizzleRideDesc",
+        [
+            "Raindrops follow vocals and the bus moves with the beat. Adjust their intensity separately.",
+            "雨滴随人声变化，车身随鼓点起伏，可分别调节强度。",
+            "Tetes hujan mengikuti vokal dan bus bergerak mengikuti irama. Atur intensitasnya secara terpisah.",
+            "Giọt mưa theo giọng hát, xe chuyển động theo nhịp trống. Có thể chỉnh cường độ riêng.",
+        ],
+    ),
+];
+
 #[test]
 fn every_shared_locale_value_matches_the_original() {
     let locales = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("..").join("crates/folia-i18n/locales");
     let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../i18n/fixtures/original");
     let mut compared = 0;
-    for (locale, rust_file) in [("en", "en.toml"), ("zh-CN", "zh-CN.toml"), ("in", "in.toml"), ("vi", "vi.toml")] {
+    for (locale_index, (locale, rust_file)) in
+        [("en", "en.toml"), ("zh-CN", "zh-CN.toml"), ("in", "in.toml"), ("vi", "vi.toml")].into_iter().enumerate()
+    {
         let text = std::fs::read_to_string(fixtures.join(format!("{locale}.ts"))).unwrap();
-        let original = flatten_json(parse_original(&text));
+        let mut expected = flatten_json(parse_original(&text));
         let rust: toml::Table = toml::from_str(&std::fs::read_to_string(locales.join(rust_file)).unwrap()).unwrap();
         let rust = flatten_toml(rust);
+        for &(key, translations) in NATIVE_LOCALE_COPY {
+            assert!(expected.contains_key(key), "{locale} native copy has no original key: {key}");
+            assert!(rust.contains_key(key), "{locale} native copy is missing: {key}");
+            expected.insert(key.to_owned(), translations[locale_index].to_owned());
+        }
         let mut diffs = Vec::new();
         for (key, value) in &rust {
-            if let Some(want) = original.get(key)
+            if let Some(want) = expected.get(key)
                 && want != value
             {
                 diffs.push(format!("{key}: {want:?} != {value:?}"));
             }
-            if original.contains_key(key) {
+            if expected.contains_key(key) {
                 compared += 1;
             }
         }
@@ -184,7 +268,7 @@ fn every_shared_locale_value_matches_the_original() {
             "ui.equalizerEffectNoiseTagHint",
             "localMusic.cancel",
         ] {
-            assert_eq!(rust.get(key), original.get(key), "{locale} {key}");
+            assert_eq!(rust.get(key), expected.get(key), "{locale} {key}");
         }
     }
     assert!(compared > 500, "only {compared} shared keys were compared");

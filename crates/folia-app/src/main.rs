@@ -31,28 +31,13 @@ fn window_settings() -> anyhow::Result<iced::window::Settings> {
             .into_rgba8();
     let (width, height) = image.dimensions();
     let icon = iced::window::icon::from_rgba(image.into_raw(), width, height)?;
+    #[cfg(windows)]
+    folia_render::backend::prepare_taskbar_icon(icon.clone())?;
     Ok(iced::window::Settings {
-        size: folia_ui::INITIAL_WINDOW,
-        min_size: Some(folia_ui::MIN_WINDOW_SIZE),
         icon: Some(icon),
-        decorations: false,
-        platform_specific: platform_window(),
-        ..Default::default()
+        exit_on_close_request: false,
+        ..folia_render::backend::window_settings(folia_ui::INITIAL_WINDOW, folia_ui::MIN_WINDOW_SIZE)
     })
-}
-
-#[cfg(target_os = "windows")]
-fn platform_window() -> iced::window::settings::PlatformSpecific {
-    iced::window::settings::PlatformSpecific {
-        undecorated_shadow: true,
-        corner_preference: iced::window::settings::platform::CornerPreference::Round,
-        ..Default::default()
-    }
-}
-
-#[cfg(not(target_os = "windows"))]
-fn platform_window() -> iced::window::settings::PlatformSpecific {
-    iced::window::settings::PlatformSpecific::default()
 }
 
 /// Feeds every event to the in-memory session log and, when its switch is on, the file.
@@ -96,18 +81,49 @@ fn main() -> anyhow::Result<()> {
     let store = Store::at(&dirs.config);
     let developer: DeveloperSettings = store.load_or_default();
     let log = init_logging(&dirs, &developer);
-    let general: GeneralSettings = store.load_or_default();
+    let general = GeneralSettings::load(&store).unwrap_or_else(|err| {
+        tracing::warn!(error = &err as &dyn std::error::Error, "general settings unreadable, using defaults");
+        GeneralSettings::default()
+    });
     let system_locale = sys_locale::get_locale();
     let i18n = I18n::new(general.language.resolve(system_locale.as_deref()))?;
-    tracing::info!(config = %store.dir().display(), language = i18n.language().code(), "starting");
+    tracing::info!(version = env!("CARGO_PKG_VERSION"), config = %store.dir().display(), language = i18n.language().code(), "starting");
     folia_ui::install_fonts();
     let graphics_failure = i18n.t("status.graphicsInitializationFailed").to_owned();
+    let graphics: folia_store::GraphicsSettings = store.load_or_default();
+    let system_reduced_motion = graphics.motion.follow_system
+        && folia_ui::graphics::system_preference().unwrap_or_else(|error| {
+            tracing::warn!(%error, "cannot read initial system animation preference");
+            false
+        });
+    folia_render::backend::configure_power_preference(folia_ui::graphics::power_preference(graphics.gpu_preference));
 
     let init = Init {
-        appearance: store.load_or_default::<AppearanceSettings>(),
+        storage: folia_store::StorageSettings::load_and_resume(&store).unwrap_or_else(|error| {
+            tracing::warn!(
+                error = &error as &dyn std::error::Error,
+                "cache directory settings unreadable, using defaults"
+            );
+            Default::default()
+        }),
+        appearance: AppearanceSettings::load(&store).unwrap_or_else(|err| {
+            tracing::warn!(error = &err as &dyn std::error::Error, "appearance settings unreadable, using defaults");
+            AppearanceSettings::default()
+        }),
+        graphics,
+        scene: store.load_or_default::<folia_store::SceneSettings>(),
+        system_reduced_motion,
+        analysis_models: std::env::current_exe()?
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("assets")
+            .join("models"),
         theme: store.load_or_default::<folia_store::ThemeSettings>(),
         audio: store.load_or_default::<folia_store::AudioSettings>(),
-        playback: store.load_or_default::<PlaybackSettings>(),
+        playback: PlaybackSettings::load(&store).unwrap_or_else(|err| {
+            tracing::warn!(error = &err as &dyn std::error::Error, "playback settings unreadable, using defaults");
+            Default::default()
+        }),
         unlock: store.load_or_default::<folia_store::UnlockSettings>(),
         player: store.load_or_default::<PlayerSettings>(),
         visualizer: store.load_or_default::<folia_store::VisualizerSettings>(),
@@ -128,6 +144,7 @@ fn main() -> anyhow::Result<()> {
         .default_font(interface_font)
         .title(Shell::title)
         .theme(Shell::theme)
+        .style(Shell::window_style)
         .subscription(Shell::subscription)
         .window(window_settings()?)
         .run();

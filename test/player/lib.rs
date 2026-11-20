@@ -11,6 +11,49 @@ use folia_player::{Analyser, Player, PlayerState, TAP_CAPACITY, map_channels, pu
 
 mod equalizer;
 mod progressive;
+mod room;
+
+#[test]
+fn listening_counts_audio_not_seeks_pauses_or_bookmarks() {
+    use folia_player::ListenTracker;
+    let start = Instant::now();
+    let mut tracker = ListenTracker::default();
+    for second in 0..=20 {
+        tracker.observe(180.0 + second as f64, start + Duration::from_secs(second), true);
+    }
+    tracker.discontinuity();
+    for second in 21..=40 {
+        tracker.observe(200.5, start + Duration::from_secs(second), false);
+    }
+    tracker.discontinuity();
+    tracker.observe(260.0, start + Duration::from_secs(41), true);
+    assert!(tracker.settle(300.0).is_none());
+    for second in 42..=73 {
+        tracker.observe(second as f64, start + Duration::from_secs(second), true);
+    }
+    assert_eq!(tracker.settle(300.0), Some(31.0));
+    assert!(tracker.settle(300.0).is_none());
+}
+
+#[test]
+fn listening_rejects_impossible_progress_but_allows_batched_output() {
+    use folia_player::ListenTracker;
+    let start = Instant::now();
+    for hz in [30, 60, 120, 1000] {
+        let mut tracker = ListenTracker::default();
+        for tick in 0..=hz * 40 {
+            let seconds = tick as f64 / hz as f64;
+            let output = (seconds * 50.0).floor() / 50.0;
+            tracker.observe(output, start + Duration::from_secs_f64(seconds), true);
+        }
+        assert_eq!(tracker.settle(300.0), Some(40.0));
+    }
+    let mut tracker = ListenTracker::default();
+    for tick in 0..=40 {
+        tracker.observe(tick as f64, start + Duration::from_millis(tick), true);
+    }
+    assert!(tracker.settle(300.0).is_none());
+}
 
 #[test]
 fn maps_channels() {
@@ -60,7 +103,7 @@ fn wait_for(player: &Player, timeout: Duration, done: impl Fn(&folia_player::Sta
 
 #[test]
 fn plays_seeks_and_ends() {
-    let Ok(player) = Player::new() else {
+    let Ok(mut player) = Player::new() else {
         eprintln!("no audio device, skipping");
         return;
     };
@@ -73,26 +116,56 @@ fn plays_seeks_and_ends() {
     let status = wait_for(&player, Duration::from_secs(2), |s| s.position > 0.3);
     assert_eq!(status.state, PlayerState::Playing);
     assert!((status.duration - 1.5).abs() < 0.01, "{status:?}");
+    let heard = player.heard_position();
+    assert!(heard >= status.position - 0.25 && heard <= player.status().position, "heard={heard},status={status:?}");
 
     player.pause();
     let paused_at = player.status().position;
     sleep(Duration::from_millis(200));
     assert!((player.status().position - paused_at).abs() < 0.05, "position holds while paused");
+    assert!(
+        (player.heard_position() - paused_at).abs() < 0.05,
+        "output clock advances through queued audio then holds"
+    );
 
     player.seek(1.0);
     sleep(Duration::from_millis(100));
     let after_seek = player.status();
     assert_eq!(after_seek.state, PlayerState::Paused);
     assert!((after_seek.position - 1.0).abs() < 0.05, "{after_seek:?}");
+    assert!((player.heard_position() - 1.0).abs() < 0.05, "seek must discard the old output clock");
 
     player.resume();
     let ended = wait_for(&player, Duration::from_secs(3), |s| s.state == PlayerState::Ended);
     assert_eq!(ended.state, PlayerState::Ended);
     assert!(ended.position > 1.4, "{ended:?}");
 
-    player.stop();
-    sleep(Duration::from_millis(50));
+    player.stop_and_release().recv_timeout(Duration::from_secs(2)).unwrap();
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        drop(std::fs::OpenOptions::new().read(true).share_mode(0).open(&wav).unwrap());
+    }
     assert_eq!(player.status().state, PlayerState::Idle);
+    assert_eq!(player.heard_position(), 0.0);
+    let response = folia_core::RoomImpulseResponse {
+        sample_rate: player.sample_rate(),
+        channels: std::array::from_fn(|_| vec![0.0; 256]),
+        gain: 1.0,
+    };
+    player.set_room(Some(Box::new(folia_player::RoomConvolver::new(&response).unwrap()))).unwrap();
+    player.set_room(None).unwrap();
+    assert!(!player.finish_room_change(), "stopped callback has not acknowledged the release yet");
+    player.stop();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !player.finish_room_change() {
+        assert!(Instant::now() < deadline, "stopping transport interrupted the room's release callback");
+        sleep(Duration::from_millis(20));
+    }
+    player.load(&wav);
+    let restarted = wait_for(&player, Duration::from_secs(2), |s| s.position > 0.1);
+    assert_eq!(restarted.state, PlayerState::Playing);
+    player.stop();
 }
 
 #[test]

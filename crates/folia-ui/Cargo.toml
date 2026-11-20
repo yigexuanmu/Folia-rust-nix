@@ -7,7 +7,11 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+folia-acoustics.workspace = true
+folia-ai.workspace = true
+folia-analysis.workspace = true
 folia-core.workspace = true
+folia-media.workspace = true
 folia-lyrics.workspace = true
 folia-i18n.workspace = true
 folia-library.workspace = true
@@ -25,9 +29,6 @@ rfd.workspace = true
 tracing.workspace = true
 toml.workspace = true
 tokio.workspace = true
-
-[target.'cfg(windows)'.dependencies]
-device_query.workspace = true
 
 [lints]
 workspace = true

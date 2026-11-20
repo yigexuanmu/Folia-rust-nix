@@ -1,23 +1,25 @@
 # 测试入口
 
-日常开发按改动范围运行对应包。提交前运行一次完整离线测试。
+日常开发运行受影响的用例或测试包。跨模块改动、准备合并时集中运行一次完整离线测试。纯测试精简和历史整理只验证保留或修改的回归，并核验生产源码一致性。
 
 ```powershell
 cargo test --manifest-path test/Cargo.toml -p test-ui
 cargo test --manifest-path test/Cargo.toml --workspace
 ```
 
-默认用例覆盖行为、持久化、原版像素参考、资源释放与已修复故障。多个输入优先放在同一个用例的数据表中，断言应能指出具体错误。人工出图和一次性诊断放在本地调试流程，截图输出到系统临时目录。
+默认用例保留关键行为、兼容性和真实故障回归。优先扩充已有文件，用数据表合并同类输入，复用已有覆盖。人工出图、整页遍历和一次性诊断放在本地临时验证流程，结论写入工作区schedule.md。小调整不重复运行全量、live和压力测试。
 
 ## GitHub CI
 
-CI 在 `main` 推送和 PR 更新时运行。CI 使用下列明确的特性组合，硬件 GPU 回归会标记为跳过。
+CI 在 `main`、`test-*` 分支推送和 PR 更新时运行。改动先在测试分支通过全部检查，再合入 `main`。CI 使用下列明确的特性组合，硬件 GPU 回归会标记为跳过。
 
 ```powershell
 cargo test --manifest-path test/Cargo.toml --workspace --features test-ui/ci,test-render/ci,test-visualizer/ci,test-visual-lumiere/ci,test-visual-monet/ci
 ```
 
 `stress` 和 `live` 是单独的本地入口，通过显式特性和 `--ignored` 启用。
+
+Linux MPRIS 使用独立 `mpris` CI job：`cargo clippy -p folia-media --all-targets -- -D warnings` 与 `cargo test --manifest-path test/Cargo.toml -p test-media`。需要 `dbus-daemon`；用例自行启动临时会话总线，不读取桌面总线或真实设置，检查服务发现、属性类型、控制消息、本地 PNG 封面、变化信号、多实例及总线重启重连。UI 的暂停导航和停止契约并入 `test/ui/session.rs`。未覆盖具体 Wayland compositor 的窗口激活策略或 Noctalia UI。
 
 ## 长时间资源回归
 

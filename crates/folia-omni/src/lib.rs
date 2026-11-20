@@ -1,15 +1,21 @@
 // Online music: one facade (`Omni`) over every platform provider; only providers talk to platform APIs.
 
 mod audio_cache;
+mod cache_location;
+pub use cache_location::{CacheSwitch, CachedCover};
 mod audio_ranges;
+mod catalog;
+pub use catalog::{Artist, TrackCatalog};
 pub mod lx;
 pub use audio_cache::{PrefetchPlan, prefetch_indices, url_is_fresh};
 mod paging;
 mod providers;
 mod qr;
 mod reads;
+mod reporting;
 pub mod session;
 pub mod unlock;
+pub use reporting::PlaybackReport;
 
 use std::future::Future;
 use std::hash::{Hash, Hasher};
@@ -36,6 +42,12 @@ pub enum OmniError {
     UnknownProvider(String),
     #[error("request failed")]
     Http(#[from] reqwest::Error),
+    #[cfg(feature = "qq")]
+    #[error("QQ sign-in connection failed")]
+    QqSocket(#[source] Box<tokio_tungstenite::tungstenite::Error>),
+    #[cfg(feature = "qq")]
+    #[error("QQ sign-in MQTT packet is invalid")]
+    QqMqtt(#[from] rumqttc::v5::mqttbytes::Error),
     #[error("audio download timed out after 60 seconds waiting for {0}")]
     AudioTimeout(&'static str),
     #[error("platform answered with code {0}")]
@@ -46,8 +58,18 @@ pub enum OmniError {
     Unavailable,
     #[error("a paid subscription is required to play this song")]
     SubscriptionRequired,
+    #[error("no enabled custom source can play this song")]
+    CustomSourceUnavailable,
     #[error("not signed in")]
     SignedOut,
+    #[error("listening report frequency exceeded")]
+    ReportThrottled,
+    #[error("listening report timed out")]
+    ReportTimeout,
+    #[error("cache relocation is in progress")]
+    CacheMoving,
+    #[error("cache access failed")]
+    Cache(#[source] folia_store::StoreError),
     /// The platform has no such capability in the original either.
     #[error("{0} is not supported on this platform")]
     Unsupported(&'static str),
@@ -126,7 +148,7 @@ pub struct Platform {
 const PLATFORMS: [(&str, &str, &str, char, u32, &str, &str); 7] = [
     ("netease", "NetEase Cloud Music", "网易云", '云', 0xdc2626, "home.loginTitle", "home.loginNote"),
     ("kugou", "KuGou Music", "酷狗", 'K', 0x2563eb, "home.loginTitleKugou", "home.loginNoteKugou"),
-    ("qq", "QQ Music", "QQ音乐", 'Q', 0x16a34a, "home.loginTitleQq", "home.loginNoteQq"),
+    ("qq", "QQ Music", "QQ音乐", 'Q', 0x16a34a, "home.loginTitleQq", "home.loginNoteQqAppScan"),
     ("bodian", "波点音乐", "波点", '波', 0x0d9488, "home.loginTitleBodian", "home.loginNoteBodian"),
     ("ytm", "YouTube Music", "YT Music", 'Y', 0xe11d48, "home.loginTitleYtm", "home.loginNoteYtmBrowser"),
     ("spotify", "Spotify", "Spotify", 'S', 0x22c55e, "home.loginTitleSpotify", "home.loginNoteSpotify"),
@@ -138,6 +160,13 @@ const PLATFORMS: [(&str, &str, &str, char, u32, &str, &str); 7] = [
 pub struct LoginCode {
     pub key: String,
     pub content: QrContent,
+}
+
+/// A provider's available QR authorization channel and its localized label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoginMethod {
+    pub id: &'static str,
+    pub label_key: &'static str,
 }
 
 /// What a sign-in code holds: an address to encode, or the platform's own picture of the code.
@@ -211,6 +240,8 @@ impl Collection {
 /// A collection's songs and the account's relation to it.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct CollectionDetail {
+    /// The album's own credits, distinct from guest credits on individual tracks.
+    pub artists: Vec<folia_core::ArtistRef>,
     pub tracks: Vec<Track>,
     /// Whether the account saved it; `None` where saving does not apply (daily songs, personal FM).
     pub subscribed: Option<bool>,
@@ -262,6 +293,9 @@ pub struct ProviderLyrics {
 /// What one platform can do. Search results are tracks whose `online` id points back at the platform.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Capabilities {
+    pub artist_search: bool,
+    pub artists: bool,
+    pub albums: bool,
     /// `likes`: songs can be liked and the account's liked ids read.
     pub likes: bool,
     /// `playlistTrackMutations`: a song can be added to one of the account's own playlists.
@@ -271,6 +305,19 @@ pub struct Capabilities {
 }
 
 pub trait Provider: Send + Sync {
+    fn playback_reporting_ready(&self) -> bool {
+        false
+    }
+    fn can_report_playback(&self, _track: &Track) -> bool {
+        false
+    }
+    fn report_playback<'a>(
+        &'a self,
+        _track: &'a Track,
+        _report: PlaybackReport,
+    ) -> BoxFuture<'a, Result<(), OmniError>> {
+        Box::pin(async { Err(OmniError::Unsupported("listening reports")) })
+    }
     fn id(&self) -> &'static str;
     fn display_name(&self) -> &'static str;
     /// Only the provider interprets its identifiers and maps them to an LX platform.
@@ -283,6 +330,39 @@ pub trait Provider: Send + Sync {
         limit: u32,
         offset: u32,
     ) -> BoxFuture<'a, Result<Page<Track>, OmniError>>;
+    fn search_artists<'a>(
+        &'a self,
+        _query: &'a str,
+        _limit: u32,
+        _offset: u32,
+    ) -> BoxFuture<'a, Result<Page<Artist>, OmniError>> {
+        Box::pin(async { Err(OmniError::Unsupported("artist search")) })
+    }
+    fn artist_detail<'a>(&'a self, _artist: &'a OnlineId) -> BoxFuture<'a, Result<Artist, OmniError>> {
+        Box::pin(async { Err(OmniError::Unsupported("artist details")) })
+    }
+    fn artist_tracks<'a>(
+        &'a self,
+        _artist: &'a OnlineId,
+        _limit: u32,
+        _offset: u32,
+    ) -> BoxFuture<'a, Result<Page<Track>, OmniError>> {
+        Box::pin(async { Err(OmniError::Unsupported("artist tracks")) })
+    }
+    fn artist_albums<'a>(
+        &'a self,
+        _artist: &'a OnlineId,
+        _limit: u32,
+        _offset: u32,
+    ) -> BoxFuture<'a, Result<Page<Collection>, OmniError>> {
+        Box::pin(async { Err(OmniError::Unsupported("artist albums")) })
+    }
+    fn track_catalog<'a>(&'a self, track: &'a Track) -> BoxFuture<'a, Result<TrackCatalog, OmniError>> {
+        Box::pin(async move { Ok(TrackCatalog::from_track(track)) })
+    }
+    fn album<'a>(&'a self, _album: &'a OnlineId) -> BoxFuture<'a, Result<Collection, OmniError>> {
+        Box::pin(async { Err(OmniError::Unsupported("album details")) })
+    }
     /// The levels this platform tells apart, lowest first; without one it is `UNLISTED_AUDIO_QUALITY_LEVELS`.
     fn audio_quality_levels(&self) -> &'static [AudioQuality] {
         &UNLISTED_AUDIO_QUALITY_LEVELS
@@ -306,7 +386,18 @@ pub trait Provider: Send + Sync {
     fn chorus_ranges<'a>(&'a self, _song: &'a OnlineId) -> BoxFuture<'a, Result<Vec<ChorusRange>, OmniError>> {
         Box::pin(async { Ok(Vec::new()) })
     }
+    fn login_methods(&self) -> &'static [LoginMethod] {
+        &[]
+    }
+    fn cancel_login(&self) {}
     fn login_code(&self) -> BoxFuture<'_, Result<LoginCode, OmniError>>;
+    fn login_code_with_method(&self, method: &str) -> BoxFuture<'_, Result<LoginCode, OmniError>> {
+        if method.is_empty() {
+            self.login_code()
+        } else {
+            Box::pin(async { Err(OmniError::Unsupported("login method")) })
+        }
+    }
     fn check_login<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<LoginState, OmniError>>;
     /// The signed-in account, or `None` when the session is missing or ran out.
     fn account(&self) -> BoxFuture<'_, Result<Option<Account>, OmniError>>;
@@ -371,7 +462,7 @@ type CoverLocks = parking_lot::Mutex<std::collections::HashMap<PathBuf, std::syn
 pub struct Omni {
     providers: Arc<Vec<Box<dyn Provider>>>,
     http: reqwest::Client,
-    cache_dir: PathBuf,
+    cache: Arc<cache_location::CacheLocation>,
     /// Platform sessions: keyring first, then a file sealed by systemd-creds when it is unavailable.
     sessions: Arc<session::Store>,
     covers: Arc<tokio::sync::Semaphore>,
@@ -381,6 +472,7 @@ pub struct Omni {
     /// Fallback audio sources and their switches, consulted for VIP or copyright restrictions.
     unlock: Arc<unlock::Unlock>,
     unlock_settings: Arc<parking_lot::RwLock<folia_store::UnlockSettings>>,
+    report_gate: Arc<reporting::ReportGate>,
 }
 
 impl Omni {
@@ -390,17 +482,19 @@ impl Omni {
             .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36")
             .build()?;
         let covers = Arc::new(tokio::sync::Semaphore::new(COVER_DOWNLOADS));
+        let sessions = Arc::new(session::Store::new(keyring_service));
         Ok(Self {
             providers: Arc::new(providers::all(&http)),
             unlock: Arc::new(unlock::Unlock::new(http.clone())),
             unlock_settings: Arc::default(),
             http,
-            cache_dir,
-            sessions: Arc::new(session::Store::new(keyring_service)),
+            cache: Arc::new(cache_location::CacheLocation::new(cache_dir)),
+            sessions,
             covers,
             cover_locks: Arc::default(),
             sources: Arc::default(),
             audio_cache: Arc::default(),
+            report_gate: Arc::default(),
         })
     }
 
@@ -421,11 +515,25 @@ impl Omni {
         store: folia_store::Store,
         data_dir: PathBuf,
     ) -> Result<lx::SourceSettings, lx::SourceError> {
-        self.sources.restore(store, data_dir, self.http.clone())
+        let result = self.sources.restore(store, data_dir, self.http.clone());
+        self.audio_cache.invalidate();
+        result
     }
 
     pub fn custom_sources(&self) -> lx::SourceSettings {
         self.sources.list()
+    }
+
+    /// Whether audio is restricted to the enabled custom sources.
+    pub fn custom_source_only(&self) -> bool {
+        self.sources.custom_only()
+    }
+
+    /// Persists custom-only playback and invalidates work prepared under the previous routing policy.
+    pub fn set_custom_source_only(&self, custom_only: bool) -> Result<lx::SourceSettings, lx::SourceError> {
+        let settings = self.sources.set_custom_only(custom_only)?;
+        self.audio_cache.invalidate();
+        Ok(settings)
     }
 
     pub fn import_source(&self, path: &Path) -> Result<lx::SourceSettings, lx::SourceError> {
@@ -563,8 +671,15 @@ impl Omni {
                 }
             }
         }
+        self.allow_native_audio()?;
         tracing::info!(provider = song.provider, "resolving audio through native platform");
-        provider.audio_source(song, resolve_quality(provider.audio_quality_levels(), preference)).await
+        let result = provider.audio_source(song, resolve_quality(provider.audio_quality_levels(), preference)).await;
+        self.allow_native_audio()?;
+        result
+    }
+
+    fn allow_native_audio(&self) -> Result<(), OmniError> {
+        if self.sources.custom_only() { Err(OmniError::CustomSourceUnavailable) } else { Ok(()) }
     }
 
     async fn custom_audio_source(
@@ -672,7 +787,20 @@ impl Omni {
 
     /// Asks for a sign-in code and draws it as a QR matrix.
     pub async fn login_qr(&self, provider: &str) -> Result<LoginQr, OmniError> {
-        let code = self.provider(provider)?.login_code().await?;
+        self.login_qr_with_method(provider, "").await
+    }
+
+    pub fn login_methods(&self, provider: &str) -> Result<&'static [LoginMethod], OmniError> {
+        Ok(self.provider(provider)?.login_methods())
+    }
+
+    pub fn cancel_login(&self, provider: &str) -> Result<(), OmniError> {
+        self.provider(provider)?.cancel_login();
+        Ok(())
+    }
+
+    pub async fn login_qr_with_method(&self, provider: &str, method: &str) -> Result<LoginQr, OmniError> {
+        let code = self.provider(provider)?.login_code_with_method(method).await?;
         match code.content {
             QrContent::Url(url) => LoginQr::encode(code.key, &url),
             QrContent::Png(png) => LoginQr::decode_png(code.key, &png),
@@ -849,7 +977,19 @@ impl Omni {
 
     /// Downloads a cover once into `covers/` and returns the cached file. The platform's CDN is asked for a `px`
     /// square (`getSizedCoverUrl`); `http://` is read as `https://`; at most `COVER_DOWNLOADS` run at once.
-    pub async fn fetch_cover(&self, url: &str, px: u32) -> Result<PathBuf, OmniError> {
+    pub async fn fetch_cover(&self, url: &str, px: u32) -> Result<CachedCover, OmniError> {
+        loop {
+            let mut access = self.cache.read().await?;
+            let result = tokio::select! {
+                biased;
+                _ = access.changed.changed() => continue,
+                result = self.fetch_cover_at(url, px, &access.path) => result,
+            };
+            return result.map(|path| CachedCover { path, _access: access });
+        }
+    }
+
+    async fn fetch_cover_at(&self, url: &str, px: u32, cache: &Path) -> Result<PathBuf, OmniError> {
         let url = https(url);
         // A small preview can reuse a larger cached CDN representation without another download.
         if px <= 64 {
@@ -859,14 +999,14 @@ impl Omni {
                     .iter()
                     .find_map(|provider| provider.sized_cover(&url, size))
                     .unwrap_or_else(|| url.clone());
-                let cached = self.cache_dir.join("covers").join(cover_cache_key(&address));
+                let cached = cache.join("covers").join(cover_cache_key(&address));
                 if cached.is_file() {
                     return Ok(cached);
                 }
             }
         }
         let url = self.providers.iter().find_map(|provider| provider.sized_cover(&url, px)).unwrap_or(url);
-        let dir = self.cache_dir.join("covers");
+        let dir = cache.join("covers");
         let path = dir.join(cover_cache_key(&url));
         if path.is_file() {
             return Ok(path);
