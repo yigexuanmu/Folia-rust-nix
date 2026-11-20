@@ -84,20 +84,20 @@ cargo build --release -p folia-app
 
 ### Nix
 
-仓库内包含完整的 Nix flake（`flake.nix`），无需额外配置：
+本分支基于上游 v0.1.3，只加入 Nix 安装（`flake.nix`）与桌面项、图标，不含其他改动：
 
 ```bash
 # 直接运行（不安装）
-nix run github:yigexuanmu/Folia-rust-nix
+nix run github:yigexuanmu/Folia-rust-nix/beta
 
 # 临时进入 shell
-nix shell github:yigexuanmu/Folia-rust-nix -c folia
+nix shell github:yigexuanmu/Folia-rust-nix/beta -c folia
 
 # 安装到系统（NixOS flake）
 {
   inputs = {
     folia-rust = {
-      url = "github:yigexuanmu/Folia-rust-nix";
+      url = "github:yigexuanmu/Folia-rust-nix/beta";
       inputs.nixpkgs.follows = "nixpkgs";
     };
   };
